@@ -21,11 +21,13 @@ jobs:
       - name: Configure
         shell: bash
         run: |
+          SRC=$(dirname "$(find . -name CMakeLists.txt -not -path './build/*' | head -n 1)")
+          echo "Project folder: $SRC"
           if [ "${{ runner.os }}" = "macOS" ]; then
-            cmake -B build -DCMAKE_BUILD_TYPE=Release -DCOPY_AFTER_BUILD=OFF \
+            cmake -S "$SRC" -B build -DCMAKE_BUILD_TYPE=Release -DCOPY_AFTER_BUILD=OFF \
               -DCMAKE_OSX_ARCHITECTURES="arm64;x86_64" -DCMAKE_OSX_DEPLOYMENT_TARGET=11.0
           else
-            cmake -B build -DCMAKE_BUILD_TYPE=Release -DCOPY_AFTER_BUILD=OFF
+            cmake -S "$SRC" -B build -DCMAKE_BUILD_TYPE=Release -DCOPY_AFTER_BUILD=OFF
           fi
 
       - name: Build
