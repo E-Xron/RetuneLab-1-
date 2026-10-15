@@ -53,8 +53,13 @@ float ClipEngine::medianPitch (const ClipAnalysis& an, int a, int b)
     for (int f = fa; f <= fb; ++f)
         if (! std::isnan (an.contour[(size_t) f])) v.push_back (an.contour[(size_t) f]);
     if (v.empty()) return kNaN;
-    std::nth_element (v.begin(), v.begin() + (long) v.size() / 2, v.end());
-    return v[v.size() / 2];
+
+    // Pitch centre: skip the onset scoop and release droop, then take the median of the steady part.
+    std::vector<float> w = v;
+    if (v.size() >= 8)
+        w.assign (v.begin() + (long) (v.size() * 15 / 100), v.end() - (long) (v.size() / 10));
+    std::nth_element (w.begin(), w.begin() + (long) w.size() / 2, w.end());
+    return w[w.size() / 2];
 }
 
 void ClipEngine::analyse (const std::vector<float>& mono, double sr, ClipAnalysis& an, std::vector<Note>& notes)
@@ -149,12 +154,13 @@ void ClipEngine::render (const float* const* src, int nch, int len, double sr,
                          std::vector<std::vector<float>>& out)
 {
     out.assign ((size_t) nch, std::vector<float> ((size_t) len, 0.f));
-    std::vector<float> mono ((size_t) len, 0.f), mask ((size_t) len, 1.f);
+    std::vector<float> mono ((size_t) len, 0.f), cover ((size_t) len, 0.f);
     for (int c = 0; c < nch; ++c)
         for (int i = 0; i < len; ++i) mono[(size_t) i] += src[c][i] / (float) nch;
 
     const double pi = 3.14159265358979323846;
     const int Tmin = std::max (8, (int) (sr / 1000.0)), Tmax = (int) (sr / 70.0);
+    const int h = std::max (8, (int) (0.004 * sr));            // half-length of the note-to-note crossfade (4 ms)
 
     auto freqAt = [&] (int s, float fallbackMidi) -> double
     {
@@ -182,29 +188,43 @@ void ClipEngine::render (const float* const* src, int nch, int len, double sr,
     auto renderNote = [&] (const Note& nt) -> bool
     {
         const int a = std::max (0, nt.srcStart), b = std::min (len, nt.srcEnd);
-        if (b - a < 128 || nt.outLen < 128) return false;
+        if (b - a < 128 || nt.outLen < 2 * h + 16) return false;
 
-        std::vector<int> marks;                           // pitch-synchronous analysis marks
+        // Pitch marks, extended a little past both ends so the crossfade regions have real audio to use.
+        const int lo = std::max (0, a - 2 * h), hi = std::min (len - 1, b + 2 * h);
+        std::vector<int> marks;
         int m = argmax (a, std::min (b - 1, a + periodAt (a, nt.detectedMid)));
         marks.push_back (m);
         for (;;)
         {
             const int T = periodAt (m, nt.detectedMid), nxt = m + T;
-            if (nxt >= b) break;
-            const int lo = std::max (m + 1, nxt - T / 4), hi = std::min (b - 1, nxt + T / 4);
-            if (hi <= lo) break;
-            m = argmax (lo, hi);
+            if (nxt >= hi) break;
+            const int l2 = std::max (m + 1, nxt - T / 4), h2 = std::min (hi, nxt + T / 4);
+            if (h2 <= l2) break;
+            m = argmax (l2, h2);
             marks.push_back (m);
         }
+        std::vector<int> pre;
+        m = marks.front();
+        for (;;)
+        {
+            const int T = periodAt (m, nt.detectedMid), prv = m - T;
+            if (prv <= lo) break;
+            const int l2 = std::max (lo, prv - T / 4), h2 = std::min (m - 1, prv + T / 4);
+            if (h2 <= l2) break;
+            m = argmax (l2, h2);
+            pre.push_back (m);
+        }
+        marks.insert (marks.begin(), pre.rbegin(), pre.rend());
         if (marks.size() < 3) return false;
 
         const double ratio   = std::pow (2.0, (double) (nt.targetMid - nt.detectedMid) / 12.0);
         const double stretch = (double) (b - a) / (double) nt.outLen;
-        const int fade = std::max (1, std::min ((int) (0.005 * sr), nt.outLen / 2));
+        const double endT = (double) (nt.outLen - h);
 
-        double ts = 0.0;
+        double ts = -(double) h;
         size_t k = 0;
-        while (ts < (double) nt.outLen)
+        while (ts < (double) (nt.outLen + h))
         {
             const double tsrc = (double) a + ts * stretch;
             while (k + 1 < marks.size() && std::abs ((double) marks[k + 1] - tsrc) <= std::abs ((double) marks[k] - tsrc)) ++k;
@@ -213,10 +233,10 @@ void ClipEngine::render (const float* const* src, int nch, int len, double sr,
             const double g = Ts / (double) Ta;
             const int centre = nt.outStart + (int) std::lround (ts);
 
+            // raised-cosine in/out: neighbouring notes overlap by 2h and their weights sum to 1
             double fg = 1.0;
-            if (ts < fade) fg = ts / fade;
-            const double rem = (double) nt.outLen - ts;
-            if (rem < fade) fg = std::min (fg, rem / fade);
+            if (ts < (double) h) fg = 0.5 - 0.5 * std::cos (pi * (ts + h) / (2.0 * h));
+            if (ts > endT)       fg = std::min (fg, 0.5 + 0.5 * std::cos (pi * (ts - endT) / (2.0 * h)));
 
             for (int j = -Ta; j <= Ta; ++j)
             {
@@ -230,22 +250,27 @@ void ClipEngine::render (const float* const* src, int nch, int len, double sr,
         return true;
     };
 
+    // Where a note replaces the original audio, remove the original with the same crossfade shape,
+    // so original + notes always add up to exactly one signal (no dips, no leaks at note boundaries).
+    auto addCover = [&] (const Note& nt)
+    {
+        const int a = std::max (0, nt.srcStart), b = std::min (len, nt.srcEnd);
+        const int s0 = std::max (0, a - h), s1 = std::min (len - 1, b + h);
+        for (int i = s0; i <= s1; ++i)
+        {
+            const double wi = i < a - h ? 0.0 : (i > a + h ? 1.0 : 0.5 - 0.5 * std::cos (pi * (double) (i - (a - h)) / (2.0 * h)));
+            const double wo = i < b - h ? 1.0 : (i > b + h ? 0.0 : 0.5 + 0.5 * std::cos (pi * (double) (i - (b - h)) / (2.0 * h)));
+            cover[(size_t) i] += (float) (wi * wo);
+        }
+    };
+
     for (const auto& nt : notes)
     {
         bool ok = true;
         if (! nt.muted) ok = renderNote (nt);
-        if (! ok) continue;                                // couldn't process: leave original audio in place
-
-        const int a = std::max (0, nt.srcStart), b = std::min (len, nt.srcEnd);
-        const int f = std::max (1, std::min ((int) (0.005 * sr), (b - a) / 2));
-        for (int i = a; i < b; ++i)
-        {
-            float g = 0.f;
-            if (i < a + f)      g = 1.f - (float) (i - a) / (float) f;
-            else if (i >= b - f) g = (float) (i - (b - f)) / (float) f;
-            mask[(size_t) i] = std::min (mask[(size_t) i], g);
-        }
+        if (ok) addCover (nt);                              // couldn't process: leave original audio in place
     }
     for (int c = 0; c < nch; ++c)
-        for (int i = 0; i < len; ++i) out[(size_t) c][(size_t) i] += src[c][i] * mask[(size_t) i];
+        for (int i = 0; i < len; ++i)
+            out[(size_t) c][(size_t) i] += src[c][i] * std::max (0.f, 1.f - cover[(size_t) i]);
 }

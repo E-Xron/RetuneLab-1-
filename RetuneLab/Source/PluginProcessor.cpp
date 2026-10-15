@@ -22,14 +22,29 @@ private:
 RetuneProcessor::RetuneProcessor()
     : AudioProcessor (BusesProperties()
           .withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
-          .withOutput ("Output", juce::AudioChannelSet::stereo(), true))
+          .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+      apvts (*this, nullptr, "STATE", createLayout())
 {
+    airOnP   = apvts.getRawParameterValue ("airOn");
+    midAirP  = apvts.getRawParameterValue ("midAir");
+    highAirP = apvts.getRawParameterValue ("highAir");
     for (auto& s : source) s.assign ((size_t) (60 * 48000), 0.f);
     worker = std::make_unique<Worker> (*this);
     worker->startThread();
 }
 
 RetuneProcessor::~RetuneProcessor() { worker->stopThread (3000); }
+
+juce::AudioProcessorValueTreeState::ParameterLayout RetuneProcessor::createLayout()
+{
+    std::vector<std::unique_ptr<juce::RangedAudioParameter>> p;
+    p.push_back (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { "airOn", 1 }, "Air On", true));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "midAir", 1 }, "Mid Air",
+        juce::NormalisableRange<float> (0.f, 1.f, 0.001f), 0.f));
+    p.push_back (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "highAir", 1 }, "High Air",
+        juce::NormalisableRange<float> (0.f, 1.f, 0.001f), 0.f));
+    return { p.begin(), p.end() };
+}
 
 bool RetuneProcessor::isBusesLayoutSupported (const BusesLayout& l) const
 {
@@ -41,6 +56,7 @@ bool RetuneProcessor::isBusesLayoutSupported (const BusesLayout& l) const
 void RetuneProcessor::prepareToPlay (double sampleRate, int)
 {
     sr = sampleRate;
+    airFx.prepare (sampleRate);
     const size_t needed = (size_t) (60.0 * sampleRate);
     for (auto& s : source) if (s.size() < needed) s.resize (needed, 0.f);
 }
@@ -81,21 +97,24 @@ void RetuneProcessor::processBlock (juce::AudioBuffer<float>& buf, juce::MidiBuf
         }
         const juce::int64 endIdx = juce::jmin (cap, pos + n - o);
         if (endIdx > (juce::int64) clipLen.load()) clipLen.store ((int) endIdx);
-        return;
     }
-
-    const int ai = activeBuf.load (std::memory_order_acquire);   // ---- playback of the edited clip
-    if (! rec && playing && havePos && ai >= 0)
+    else
     {
-        const auto& rb = renderBuf[(size_t) ai];
-        const juce::int64 len = (juce::int64) rb[0].size(), o = clipOrigin.load();
-        for (int i = 0; i < n; ++i)
+        const int ai = activeBuf.load (std::memory_order_acquire);   // ---- playback of the edited clip
+        if (! rec && playing && havePos && ai >= 0)
         {
-            const juce::int64 idx = pos + i - o;
-            if (idx < 0 || idx >= len) continue;               // outside the clip: dry input
-            for (int c = 0; c < nch; ++c) buf.setSample (c, i, rb[(size_t) c][(size_t) idx]);
+            const auto& rb = renderBuf[(size_t) ai];
+            const juce::int64 len = (juce::int64) rb[0].size(), o = clipOrigin.load();
+            for (int i = 0; i < n; ++i)
+            {
+                const juce::int64 idx = pos + i - o;
+                if (idx < 0 || idx >= len) continue;               // outside the clip: dry input
+                for (int c = 0; c < nch; ++c) buf.setSample (c, i, rb[(size_t) c][(size_t) idx]);
+            }
         }
     }
+
+    airFx.process (buf, airOnP->load() > 0.5f, midAirP->load(), highAirP->load());
 }
 
 // ---------------------------------------------------------------- worker jobs
@@ -198,6 +217,7 @@ void RetuneProcessor::getStateInformation (juce::MemoryBlock& dest)
     }
     o.writeInt (analysis.hop); o.writeInt (analysis.frameOffset); o.writeInt ((int) analysis.contour.size());
     for (float f : analysis.contour) o.writeFloat (f);
+    if (auto xml = apvts.copyState().createXml()) o.writeString (xml->toString()); else o.writeString ({});
 }
 
 void RetuneProcessor::setStateInformation (const void* data, int size)
@@ -222,6 +242,9 @@ void RetuneProcessor::setStateInformation (const void* data, int size)
     an.hop = in.readInt(); an.frameOffset = in.readInt();
     an.contour.resize ((size_t) juce::jmax (0, in.readInt()));
     for (auto& f : an.contour) f = in.readFloat();
+    if (! in.isExhausted())
+        if (auto xml = juce::XmlDocument::parse (in.readString()))
+            apvts.replaceState (juce::ValueTree::fromXml (*xml));
 
     {
         juce::ScopedLock sl (modelLock);

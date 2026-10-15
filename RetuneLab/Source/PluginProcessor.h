@@ -6,6 +6,8 @@
 #include <memory>
 #include <vector>
 #include "ClipEngine.h"
+#include "AirFx.h"
+#include "Hotkeys.h"
 
 class RetuneProcessor : public juce::AudioProcessor
 {
@@ -42,6 +44,9 @@ public:
     ClipAnalysis getAnalysis() const;
     void setNotes (std::vector<Note>);          // updates the model only; call requestRender() when done editing
 
+    juce::AudioProcessorValueTreeState apvts;   // Air parameters (automatable)
+    HotkeyMap hotkeys;
+
     // ---- state read by the UI ----
     std::atomic<bool>        recordArmed { false };
     std::atomic<juce::int64> clipOrigin { 0 };   // host sample position where the clip starts
@@ -54,6 +59,11 @@ public:
 
 private:
     class Worker;
+    static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
+    AirFx airFx;
+    std::atomic<float>* airOnP = nullptr;
+    std::atomic<float>* midAirP = nullptr;
+    std::atomic<float>* highAirP = nullptr;
     void doAnalyse();
     void doRender();
 

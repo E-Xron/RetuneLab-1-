@@ -3,11 +3,20 @@
 
 namespace
 {
-    const juce::Colour kBg     { 0xff14161b };
-    const juce::Colour kPanel  { 0xff1b1e25 };
-    const juce::Colour kBlob   { 0xff4f7cff };
-    const juce::Colour kSelect { 0xffffa94d };
     inline bool isBlack (int pc) { return pc == 1 || pc == 3 || pc == 6 || pc == 8 || pc == 10; }
+
+    juce::String midiName (float m)
+    {
+        static const char* names[12] = { "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" };
+        const int n = juce::jlimit (0, 127, (int) std::lround (m));
+        return juce::String (names[n % 12]) + juce::String (n / 12 - 2);
+    }
+
+    // The pitch a snap should start from: what was actually sung, unless the user moved it far on purpose.
+    inline float snapBase (const Note& n)
+    {
+        return std::abs (n.targetMid - n.detectedMid) > 0.5f ? n.targetMid : n.detectedMid;
+    }
 }
 
 // ===================================================================== NoteEditor
@@ -43,14 +52,18 @@ void NoteEditor::fitView()
     scrollSec = 0.0;
 }
 
+juce::Rectangle<float> NoteEditor::noteRect (const Note& n) const
+{
+    const float x0 = xFromSample (n.outStart), x1 = xFromSample (n.outEnd());
+    const float h = (float) rowH * 0.78f, yc = yFromMidi (n.targetMid);
+    return { x0, yc - h * 0.5f, std::max (2.f, x1 - x0), h };
+}
+
 int NoteEditor::hitNote (juce::Point<float> p, const std::vector<Note>& v, Zone& z) const
 {
     for (int i = (int) v.size() - 1; i >= 0; --i)
     {
-        const auto& n = v[(size_t) i];
-        const float x0 = xFromSample (n.outStart), x1 = xFromSample (n.outEnd());
-        const float h = (float) rowH * 0.8f, yc = yFromMidi (n.targetMid);
-        juce::Rectangle<float> r (x0, yc - h * 0.5f, std::max (2.f, x1 - x0), h);
+        const auto r = noteRect (v[(size_t) i]);
         if (r.expanded (0.f, 3.f).contains (p))
         {
             const float edge = std::min (7.f, r.getWidth() / 3.f);
@@ -64,72 +77,110 @@ int NoteEditor::hitNote (juce::Point<float> p, const std::vector<Note>& v, Zone&
 
 void NoteEditor::paint (juce::Graphics& g)
 {
-    g.fillAll (kBg);
+    using namespace Theme;
+    g.fillAll (bg);
     const auto roll = rollArea();
 
-    // pitch rows + keyboard
+    // ---- pitch rows + keyboard
     const int topN = (int) std::ceil (topMidi + 0.5), botN = (int) std::floor (midiFromY ((float) getHeight()) - 0.5f);
     for (int n = topN; n >= botN; --n)
     {
         if (n < 0 || n > 127) continue;
         const int pc = n % 12;
-        const float y0 = yFromMidi ((float) n + 0.5f);
+        const float y0 = std::floor (yFromMidi ((float) n + 0.5f));
         const bool inScale = ((scaleMask >> pc) & 1) != 0, blk = isBlack (pc);
-        juce::Colour c = blk ? juce::Colour (0xff15171c) : juce::Colour (0xff1b1e25);
-        if (inScale) c = c.interpolatedWith (juce::Colour (0xff35705f), 0.22f);
+
+        juce::Colour c = blk ? juce::Colour (0xff0f1116) : juce::Colour (0xff141720);
+        if (inScale) c = c.interpolatedWith (accent, blk ? 0.07f : 0.11f);
         g.setColour (c);
         g.fillRect (roll.getX(), y0, roll.getWidth(), (float) rowH);
-        g.setColour (juce::Colours::white.withAlpha (pc == 0 ? 0.20f : 0.05f));
-        g.drawHorizontalLine ((int) y0, roll.getX(), roll.getRight());
+        g.setColour (juce::Colours::white.withAlpha (pc == 0 ? 0.14f : 0.04f));
+        g.fillRect (roll.getX(), y0 + (float) rowH - 1.f, roll.getWidth(), 1.f);
 
         juce::Rectangle<float> k (0.f, y0, kKeyW, (float) rowH);
-        g.setColour (blk ? juce::Colour (0xff262a33) : juce::Colour (0xffe6e6e6));
-        g.fillRect (k.reduced (0.f, 0.5f));
+        g.setColour (blk ? juce::Colour (0xff1b1f27) : juce::Colour (0xffdfe3ea));
+        g.fillRect (k.withTrimmedBottom (1.f));
+        if (inScale)
+        {
+            g.setColour (accent);
+            g.fillEllipse (k.getRight() - 11.f, k.getCentreY() - 2.5f, 5.f, 5.f);
+        }
         if (pc == 0)
         {
-            g.setColour (juce::Colours::black.withAlpha (0.75f));
-            g.setFont (juce::FontOptions (11.f));
-            g.drawText ("C" + juce::String (n / 12 - 2), k.withTrimmedLeft (6.f), juce::Justification::centredLeft);
+            g.setColour (juce::Colour (0xff20242c));
+            g.setFont (juce::FontOptions (11.f, juce::Font::bold));
+            g.drawText ("C" + juce::String (n / 12 - 2), k.withTrimmedLeft (7.f), juce::Justification::centredLeft);
         }
     }
+    g.setColour (border);
+    g.fillRect (kKeyW - 1.f, 0.f, 1.f, (float) getHeight());
 
-    // time grid
+    // ---- time ruler + grid
     const double visibleSec = roll.getWidth() / pps;
     const double step = pps >= 40.0 ? 1.0 : (pps >= 12.0 ? 5.0 : 15.0);
+    for (double t = std::ceil (scrollSec / step) * step; t < scrollSec + visibleSec; t += step)
+    {
+        const float x = std::floor (kKeyW + (float) ((t - scrollSec) * pps));
+        g.setColour (juce::Colours::white.withAlpha (0.05f));
+        g.fillRect (x, kRuler, 1.f, (float) getHeight());
+    }
+    g.setColour (bg.withAlpha (0.88f));
+    g.fillRect (roll.getX(), 0.f, roll.getWidth(), kRuler);
     g.setFont (juce::FontOptions (10.f));
     for (double t = std::ceil (scrollSec / step) * step; t < scrollSec + visibleSec; t += step)
     {
-        const float x = kKeyW + (float) ((t - scrollSec) * pps);
-        g.setColour (juce::Colours::white.withAlpha (0.06f));
-        g.drawVerticalLine ((int) x, 0.f, (float) getHeight());
-        g.setColour (juce::Colours::white.withAlpha (0.35f));
-        g.drawText (juce::String (t, 0) + "s", (int) x + 3, 2, 40, 12, juce::Justification::left);
+        const float x = std::floor (kKeyW + (float) ((t - scrollSec) * pps));
+        g.setColour (dim);
+        g.drawText (juce::String (t, 0) + "s", (int) x + 4, 2, 40, 12, juce::Justification::left);
+        g.fillRect (x, kRuler - 4.f, 1.f, 4.f);
     }
 
-    // notes
+    // ---- notes
     const auto v = proc.getNotes();
     for (const auto& n : v)
     {
-        const float x0 = xFromSample (n.outStart), x1 = xFromSample (n.outEnd());
-        if (x1 < kKeyW || x0 > (float) getWidth()) continue;
-        const float h = (float) rowH * 0.78f, yc = yFromMidi (n.targetMid);
-        const juce::Rectangle<float> r (x0, yc - h * 0.5f, std::max (2.f, x1 - x0), h);
+        const auto r = noteRect (n);
+        if (r.getRight() < kKeyW || r.getX() > (float) getWidth()) continue;
 
         const bool edited = n.outStart != n.srcStart || n.outLen != n.srcLen() || std::abs (n.targetMid - n.detectedMid) > 0.01f;
         if (edited && ! n.muted)
         {
             const float gx0 = xFromSample (n.srcStart), gx1 = xFromSample (n.srcEnd), gy = yFromMidi (n.detectedMid);
-            g.setColour (juce::Colours::white.withAlpha (0.22f));
-            g.drawRoundedRectangle (gx0, gy - h * 0.5f, std::max (2.f, gx1 - gx0), h, 3.f, 1.f);
+            g.setColour (juce::Colours::white.withAlpha (0.18f));
+            g.drawRoundedRectangle (gx0, gy - r.getHeight() * 0.5f, std::max (2.f, gx1 - gx0), r.getHeight(), 4.f, 1.f);
         }
 
-        juce::Colour fill = n.muted ? juce::Colours::grey.withAlpha (0.25f) : (n.selected ? kSelect : kBlob).withAlpha (0.88f);
-        g.setColour (fill);
-        g.fillRoundedRectangle (r, 4.f);
-        g.setColour (juce::Colours::white.withAlpha (n.selected ? 0.9f : 0.4f));
-        g.drawRoundedRectangle (r, 4.f, 1.f);
+        if (n.muted)
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.06f));
+            g.fillRoundedRectangle (r, 5.f);
+            g.setColour (juce::Colours::white.withAlpha (0.22f));
+            g.drawRoundedRectangle (r, 5.f, 1.f);
+            continue;
+        }
 
-        if (! n.muted && ! analysisCache.contour.empty() && n.srcLen() > 0)
+        const juce::Colour c1 = n.selected ? warm : accent;
+        if (n.selected)
+        {
+            g.setColour (warm.withAlpha (0.22f));
+            g.fillRoundedRectangle (r.expanded (3.f), 7.f);
+        }
+        g.setColour (juce::Colours::black.withAlpha (0.35f));
+        g.fillRoundedRectangle (r.translated (0.f, 1.5f), 5.f);
+        g.setGradientFill (juce::ColourGradient (c1.brighter (0.25f), r.getX(), r.getY(),
+                                                 c1.darker (0.22f), r.getX(), r.getBottom(), false));
+        g.fillRoundedRectangle (r, 5.f);
+        g.setColour (juce::Colours::white.withAlpha (n.selected ? 0.9f : 0.28f));
+        g.drawRoundedRectangle (r, 5.f, n.selected ? 1.5f : 1.f);
+
+        if (r.getWidth() > 14.f)                                  // stretch grips
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.32f));
+            g.fillRoundedRectangle (r.getX() + 2.5f, r.getY() + 3.f, 2.f, r.getHeight() - 6.f, 1.f);
+            g.fillRoundedRectangle (r.getRight() - 4.5f, r.getY() + 3.f, 2.f, r.getHeight() - 6.f, 1.f);
+        }
+
+        if (! analysisCache.contour.empty() && n.srcLen() > 0)      // detected pitch curve inside the blob
         {
             juce::Graphics::ScopedSaveState ss (g);
             g.reduceClipRegion (r.expanded (0.f, 2.f).toNearestInt());
@@ -147,32 +198,50 @@ void NoteEditor::paint (juce::Graphics& g)
                 const float x = xFromSample (outS), y = yFromMidi (c + n.targetMid - n.detectedMid);
                 if (! pen) { path.startNewSubPath (x, y); pen = true; } else path.lineTo (x, y);
             }
-            g.setColour (kBg.withAlpha (0.85f));
-            g.strokePath (path, juce::PathStrokeType (1.3f));
+            g.setColour (juce::Colours::white.withAlpha (0.78f));
+            g.strokePath (path, juce::PathStrokeType (1.4f, juce::PathStrokeType::curved, juce::PathStrokeType::rounded));
         }
+
+        if (r.getWidth() > 46.f && rowH >= 13.0)                    // note name
+        {
+            g.setColour (juce::Colours::white.withAlpha (0.92f));
+            g.setFont (juce::FontOptions (10.5f, juce::Font::bold));
+            g.drawText (midiName (n.targetMid), r.withTrimmedLeft (8.f), juce::Justification::topLeft);
+        }
+    }
+
+    if (marquee)
+    {
+        g.setColour (accent.withAlpha (0.14f));
+        g.fillRect (marqueeRect);
+        g.setColour (accent.withAlpha (0.85f));
+        g.drawRect (marqueeRect, 1.f);
     }
 
     if (tool == Tool::Split && hoverX >= kKeyW)
     {
-        g.setColour (juce::Colours::white.withAlpha (0.7f));
-        g.drawVerticalLine ((int) hoverX, 0.f, (float) getHeight());
+        g.setColour (juce::Colours::white.withAlpha (0.75f));
+        g.fillRect (std::floor (hoverX), kRuler, 1.f, (float) getHeight());
     }
 
-    // playhead
+    // ---- playhead
     if (proc.clipLen.load() > 0)
     {
         const double s = (double) (proc.hostPos.load() - proc.clipOrigin.load());
-        const float x = xFromSample (s);
+        const float x = std::floor (xFromSample (s));
         if (x >= kKeyW && x <= (float) getWidth())
         {
-            g.setColour (juce::Colour (0xffff5c5c));
-            g.drawVerticalLine ((int) x, 0.f, (float) getHeight());
+            g.setColour (red);
+            g.fillRect (x, 0.f, 1.f, (float) getHeight());
+            juce::Path tri;
+            tri.addTriangle (x - 5.f, 0.f, x + 6.f, 0.f, x + 0.5f, 8.f);
+            g.fillPath (tri);
         }
     }
 
     if (v.empty())
     {
-        g.setColour (juce::Colours::white.withAlpha (0.5f));
+        g.setColour (dim);
         g.setFont (juce::FontOptions (15.f));
         g.drawFittedText ("Click Record, then play the audio in Ableton (it records from the playhead).\n"
                           "Click Record again to stop. Notes appear here for editing.",
@@ -222,11 +291,23 @@ void NoteEditor::mouseDown (const juce::MouseEvent& e)
 
     dragIdx = -1;
     didDrag = false;
-    if (idx < 0)
+    marquee = false;
+    if (idx < 0)                                         // empty space: start a selection rectangle
     {
-        if (! e.mods.isCommandDown()) { for (auto& n : v) n.selected = false; proc.setNotes (v); }
+        marquee = true;
+        marqueeStart = e.position;
+        marqueeRect = juce::Rectangle<float> (e.position, e.position);
+        marqueeBase.assign (v.size(), false);
+        if (e.mods.isCommandDown() || e.mods.isShiftDown())
+            for (size_t i = 0; i < v.size(); ++i) marqueeBase[i] = v[i].selected;
+        else
+        {
+            for (auto& n : v) n.selected = false;
+            proc.setNotes (v);
+        }
         return;
     }
+
     if (e.mods.isCommandDown()) v[(size_t) idx].selected = ! v[(size_t) idx].selected;
     else if (! v[(size_t) idx].selected) { for (auto& n : v) n.selected = false; v[(size_t) idx].selected = true; }
     proc.setNotes (v);
@@ -240,6 +321,20 @@ void NoteEditor::mouseDown (const juce::MouseEvent& e)
 
 void NoteEditor::mouseDrag (const juce::MouseEvent& e)
 {
+    if (marquee)
+    {
+        marqueeRect = juce::Rectangle<float> (marqueeStart, e.position);
+        auto v = proc.getNotes();
+        for (size_t i = 0; i < v.size(); ++i)
+        {
+            const bool base = i < marqueeBase.size() && marqueeBase[i];
+            v[i].selected = base || noteRect (v[i]).intersects (marqueeRect);
+        }
+        proc.setNotes (v);
+        repaint();
+        return;
+    }
+
     if (dragIdx < 0 || dragIdx >= (int) dragStart.size()) return;
     if (! didDrag && e.getDistanceFromDragStart() < 3) return;
     didDrag = true;
@@ -280,6 +375,7 @@ void NoteEditor::mouseDrag (const juce::MouseEvent& e)
 
 void NoteEditor::mouseUp (const juce::MouseEvent&)
 {
+    if (marquee) { marquee = false; repaint(); return; }
     if (dragIdx < 0) return;
     if (didDrag) proc.requestRender();
     else if (! undoStack.empty()) undoStack.pop_back();      // plain click: no edit happened
@@ -304,10 +400,27 @@ void NoteEditor::mouseWheelMove (const juce::MouseEvent& e, const juce::MouseWhe
 
 bool NoteEditor::keyPressed (const juce::KeyPress& k)
 {
-    if (k == juce::KeyPress::deleteKey || k == juce::KeyPress::backspaceKey) { deleteSelected(); return true; }
-    if (k.getModifiers().isCommandDown() && k.getKeyCode() == 'Z') { undo(); return true; }
-    if (k.getModifiers().isCommandDown() && k.getKeyCode() == 'A') { selectAll(); return true; }
+    const Act a = proc.hotkeys.match (k);
+    if (a != Act::None) { perform (a); return true; }
+    if (k == juce::KeyPress::backspaceKey) { deleteSelected(); return true; }   // always works as an alias
     return false;
+}
+
+void NoteEditor::perform (Act a)
+{
+    switch (a)
+    {
+        case Act::Undo:            undo(); break;
+        case Act::SelectAll:       selectAll(); break;
+        case Act::Delete:          deleteSelected(); break;
+        case Act::SnapScale:       snapToScale(); break;
+        case Act::SnapSemitone:    snapSemitone(); break;
+        case Act::Merge:           mergeSelected(); break;
+        case Act::Reset:           resetSelected(); break;
+        case Act::SplitAtPlayhead: splitAtPlayhead(); break;
+        case Act::FitView:         fitView(); break;
+        default: if (onExtraAction) onExtraAction (a); break;
+    }
 }
 
 // ---------------------------------------------------------------- edit operations
@@ -365,7 +478,7 @@ float NoteEditor::nearestInScale (float t) const
     {
         if (! ((scaleMask >> (((n % 12) + 12) % 12)) & 1)) continue;
         const float d = std::abs ((float) n - t);
-        if (d < bestD) { bestD = d; best = (float) n; }
+        if (d < bestD - 1e-4f) { bestD = d; best = (float) n; }   // on an exact tie the lower note wins
     }
     return best;
 }
@@ -401,8 +514,8 @@ void NoteEditor::runMenuAction (int r, int idx, int splitSample)
     {
         case 1: if (! splitAt (v, idx, splitSample)) { undoStack.pop_back(); return; } break;
         case 2: if (! mergeNext (v, idx))            { undoStack.pop_back(); return; } break;
-        case 3: for (auto& n : v) if (n.selected) n.targetMid = std::round (n.targetMid); break;
-        case 4: for (auto& n : v) if (n.selected) n.targetMid = nearestInScale (n.targetMid); break;
+        case 3: for (auto& n : v) if (n.selected) n.targetMid = std::round (snapBase (n)); break;
+        case 4: for (auto& n : v) if (n.selected) n.targetMid = nearestInScale (snapBase (n)); break;
         case 5: for (auto& n : v) if (n.selected) { n.outStart = n.srcStart; n.outLen = n.srcLen(); n.targetMid = n.detectedMid; n.muted = false; } break;
         case 6: { const bool m = ! v[(size_t) idx].muted; for (auto& n : v) if (n.selected) n.muted = m; break; }
         default: break;
@@ -417,7 +530,18 @@ void NoteEditor::snapToScale()
     pushUndo (v);
     bool any = false;
     for (auto& n : v) any = any || n.selected;
-    for (auto& n : v) if (! any || n.selected) n.targetMid = nearestInScale (n.targetMid);
+    for (auto& n : v) if (! any || n.selected) n.targetMid = nearestInScale (snapBase (n));
+    commit (v);
+}
+
+void NoteEditor::snapSemitone()
+{
+    auto v = proc.getNotes();
+    if (v.empty()) return;
+    pushUndo (v);
+    bool any = false;
+    for (auto& n : v) any = any || n.selected;
+    for (auto& n : v) if (! any || n.selected) n.targetMid = std::round (snapBase (n));
     commit (v);
 }
 
@@ -432,9 +556,50 @@ void NoteEditor::deleteSelected()
 {
     auto v = proc.getNotes();
     pushUndo (v);
-    bool any = false;
-    for (auto& n : v) if (n.selected) { n.muted = true; any = true; }
+    bool any = false, anyLive = false;
+    for (auto& n : v) if (n.selected) { any = true; anyLive = anyLive || ! n.muted; }
+    for (auto& n : v) if (n.selected) n.muted = anyLive;      // delete, or restore if everything selected is already deleted
     if (any) commit (v); else undoStack.pop_back();
+}
+
+void NoteEditor::mergeSelected()
+{
+    auto v = proc.getNotes();
+    int idx = -1;
+    for (int i = 0; i < (int) v.size(); ++i) if (v[(size_t) i].selected) { idx = i; break; }
+    if (idx < 0) return;
+    pushUndo (v);
+    if (mergeNext (v, idx)) commit (v); else undoStack.pop_back();
+}
+
+void NoteEditor::resetSelected()
+{
+    auto v = proc.getNotes();
+    if (v.empty()) return;
+    pushUndo (v);
+    bool any = false;
+    for (auto& n : v) any = any || n.selected;
+    for (auto& n : v)
+        if (! any || n.selected) { n.outStart = n.srcStart; n.outLen = n.srcLen(); n.targetMid = n.detectedMid; n.muted = false; }
+    commit (v);
+}
+
+void NoteEditor::splitAtPlayhead()
+{
+    auto v = proc.getNotes();
+    const int pos = (int) (proc.hostPos.load() - proc.clipOrigin.load());
+    bool any = false;
+    for (auto& n : v) any = any || n.selected;
+    for (int i = 0; i < (int) v.size(); ++i)
+    {
+        if (any && ! v[(size_t) i].selected) continue;
+        if (pos > v[(size_t) i].outStart && pos < v[(size_t) i].outEnd())
+        {
+            pushUndo (v);
+            if (splitAt (v, i, pos)) commit (v); else undoStack.pop_back();
+            return;
+        }
+    }
 }
 
 void NoteEditor::undo()
@@ -442,6 +607,120 @@ void NoteEditor::undo()
     if (undoStack.empty()) return;
     commit (undoStack.back());
     undoStack.pop_back();
+}
+
+// ===================================================================== Air window
+AirPanel::AirPanel (RetuneProcessor& p)
+{
+    auto setup = [this] (juce::Slider& s, juce::Label& l, const juce::String& t)
+    {
+        s.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
+        s.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 70, 20);
+        s.setRotaryParameters (juce::MathConstants<float>::pi * 1.2f, juce::MathConstants<float>::pi * 2.8f, true);
+        s.setDoubleClickReturnValue (true, 0.0);
+        l.setText (t, juce::dontSendNotification);
+        l.setJustificationType (juce::Justification::centred);
+        l.setFont (juce::Font (juce::FontOptions (14.f, juce::Font::bold)));
+        l.attachToComponent (&s, false);
+        addAndMakeVisible (s);
+        addAndMakeVisible (l);
+    };
+    setup (mid, midL, "Mid Air");
+    setup (high, highL, "High Air");
+    addAndMakeVisible (on);
+
+    aMid  = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (p.apvts, "midAir", mid);
+    aHigh = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (p.apvts, "highAir", high);
+    aOn   = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (p.apvts, "airOn", on);
+    for (auto* s : { &mid, &high })           // the attachments install their own text; show plain percentages instead
+    {
+        s->textFromValueFunction = [] (double v) { return juce::String ((int) std::lround (v * 100.0)) + "%"; };
+        s->valueFromTextFunction = [] (const juce::String& t) { return t.getDoubleValue() / 100.0; };
+        s->updateText();
+    }
+    setSize (380, 270);
+}
+
+void AirPanel::paint (juce::Graphics& g)
+{
+    g.fillAll (Theme::panel);
+    g.setColour (Theme::text);
+    g.setFont (juce::FontOptions (20.f, juce::Font::bold));
+    g.drawText ("Air", 20, 14, 120, 26, juce::Justification::centredLeft);
+    g.setColour (Theme::dim);
+    g.setFont (juce::FontOptions (12.f));
+    g.drawText ("Adds high-frequency sheen to the plugin's output", 20, 40, 340, 16, juce::Justification::centredLeft);
+}
+
+void AirPanel::resized()
+{
+    on.setBounds (getWidth() - 110, 16, 96, 24);
+    mid.setBounds  (30, 96, 150, 150);
+    high.setBounds (getWidth() - 180, 96, 150, 150);
+}
+
+// ===================================================================== Hotkey window
+HotkeyPanel::HotkeyPanel (RetuneProcessor& p) : proc (p)
+{
+    setWantsKeyboardFocus (true);
+    for (int i = 0; i < HotkeyMap::N; ++i)
+    {
+        auto& l = labels[(size_t) i];
+        auto& b = btns[(size_t) i];
+        l.setText (HotkeyMap::label (i), juce::dontSendNotification);
+        addAndMakeVisible (l);
+        b.setWantsKeyboardFocus (false);
+        b.onClick = [this, i]
+        {
+            capturing = i;
+            refresh();
+            grabKeyboardFocus();
+        };
+        addAndMakeVisible (b);
+    }
+    resetBtn.setWantsKeyboardFocus (false);
+    resetBtn.onClick = [this] { proc.hotkeys.resetDefaults(); capturing = -1; refresh(); };
+    addAndMakeVisible (resetBtn);
+    refresh();
+    setSize (440, 500);
+}
+
+void HotkeyPanel::refresh()
+{
+    for (int i = 0; i < HotkeyMap::N; ++i)
+        btns[(size_t) i].setButtonText (i == capturing ? juce::String ("Press a key...") : proc.hotkeys.describe (i));
+}
+
+bool HotkeyPanel::keyPressed (const juce::KeyPress& k)
+{
+    if (capturing < 0) return false;
+    if (k == juce::KeyPress::escapeKey) { capturing = -1; refresh(); return true; }
+    proc.hotkeys.set (capturing, k);
+    capturing = -1;
+    refresh();
+    return true;
+}
+
+void HotkeyPanel::paint (juce::Graphics& g)
+{
+    g.fillAll (Theme::panel);
+    g.setColour (Theme::text);
+    g.setFont (juce::FontOptions (20.f, juce::Font::bold));
+    g.drawText ("Hotkeys", 20, 14, 200, 26, juce::Justification::centredLeft);
+    g.setColour (Theme::dim);
+    g.setFont (juce::FontOptions (12.f));
+    g.drawText ("Click a shortcut, then press the new key combination. Esc cancels.", 20, 40, 400, 16, juce::Justification::centredLeft);
+}
+
+void HotkeyPanel::resized()
+{
+    int y = 72;
+    for (int i = 0; i < HotkeyMap::N; ++i, y += 30)
+    {
+        labels[(size_t) i].setBounds (20, y, 220, 26);
+        btns[(size_t) i].setBounds (250, y, 170, 26);
+    }
+    resetBtn.setBounds (getWidth() - 160, getHeight() - 44, 140, 28);
 }
 
 // ===================================================================== RetuneEditor
@@ -453,10 +732,12 @@ static const std::vector<std::vector<int>> kScaleDegrees {
 RetuneEditor::RetuneEditor (RetuneProcessor& p)
     : AudioProcessorEditor (&p), proc (p), noteEditor (p)
 {
+    setLookAndFeel (&laf);
+    setWantsKeyboardFocus (true);
     addAndMakeVisible (noteEditor);
 
     recBtn.setClickingTogglesState (true);
-    recBtn.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xffd23c3c));
+    recBtn.setColour (juce::TextButton::buttonOnColourId, Theme::red);
     recBtn.onClick = [this] { proc.setRecording (recBtn.getToggleState()); };
 
     editBtn.setClickingTogglesState (true);  editBtn.setRadioGroupId (1);  editBtn.setToggleState (true, juce::dontSendNotification);
@@ -466,6 +747,8 @@ RetuneEditor::RetuneEditor (RetuneProcessor& p)
     undoBtn.onClick  = [this] { noteEditor.undo(); };
     snapBtn.onClick  = [this] { noteEditor.snapToScale(); };
     clearBtn.onClick = [this] { proc.clearClip(); };
+    airBtn.onClick   = [this] { showAir(); };
+    keysBtn.onClick  = [this] { showHotkeys(); };
 
     keyBox.addItemList ({ "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" }, 1);
     scaleBox.addItemList (kScaleNames, 1);
@@ -473,14 +756,77 @@ RetuneEditor::RetuneEditor (RetuneProcessor& p)
     scaleBox.setSelectedItemIndex (0, juce::dontSendNotification);
     keyBox.onChange = scaleBox.onChange = [this] { updateScale(); };
 
-    for (auto* c : std::initializer_list<juce::Component*> { &recBtn, &editBtn, &splitBtn, &undoBtn, &snapBtn, &clearBtn, &keyBox, &scaleBox, &statusLabel })
+    for (auto* c : std::initializer_list<juce::Component*> { &recBtn, &editBtn, &splitBtn, &undoBtn, &snapBtn, &clearBtn,
+                                                              &airBtn, &keysBtn, &keyBox, &scaleBox, &statusLabel })
+    {
+        c->setWantsKeyboardFocus (false);           // keep keyboard shortcuts flowing to the note editor
         addAndMakeVisible (c);
+    }
     statusLabel.setJustificationType (juce::Justification::centredRight);
+    statusLabel.setColour (juce::Label::textColourId, Theme::dim);
+
+    noteEditor.onExtraAction = [this] (Act a)
+    {
+        if (a == Act::Record)    toggleRecord();
+        if (a == Act::EditTool)  selectTool (false);
+        if (a == Act::SplitTool) selectTool (true);
+    };
 
     setResizable (true, true);
-    setResizeLimits (760, 460, 1800, 1100);
-    setSize (1000, 640);
+    setResizeLimits (900, 480, 1800, 1100);
+    setSize (1040, 660);
     startTimerHz (10);
+}
+
+RetuneEditor::~RetuneEditor()
+{
+    airWin.reset();
+    keyWin.reset();
+    setLookAndFeel (nullptr);
+}
+
+void RetuneEditor::toggleRecord()
+{
+    recBtn.setToggleState (! recBtn.getToggleState(), juce::dontSendNotification);
+    proc.setRecording (recBtn.getToggleState());
+}
+
+void RetuneEditor::selectTool (bool split)
+{
+    (split ? splitBtn : editBtn).setToggleState (true, juce::dontSendNotification);
+    noteEditor.setTool (split ? NoteEditor::Tool::Split : NoteEditor::Tool::Edit);
+}
+
+void RetuneEditor::showAir()
+{
+    if (airWin == nullptr)
+    {
+        airWin = std::make_unique<ToolWindow> ("Air");
+        airWin->setLookAndFeel (&laf);
+        airWin->setContentOwned (new AirPanel (proc), true);
+        airWin->setUsingNativeTitleBar (true);
+        airWin->setResizable (false, false);
+        airWin->setAlwaysOnTop (true);
+        airWin->centreAroundComponent (this, airWin->getWidth(), airWin->getHeight());
+    }
+    airWin->setVisible (true);
+    airWin->toFront (true);
+}
+
+void RetuneEditor::showHotkeys()
+{
+    if (keyWin == nullptr)
+    {
+        keyWin = std::make_unique<ToolWindow> ("Hotkeys");
+        keyWin->setLookAndFeel (&laf);
+        keyWin->setContentOwned (new HotkeyPanel (proc), true);
+        keyWin->setUsingNativeTitleBar (true);
+        keyWin->setResizable (false, false);
+        keyWin->setAlwaysOnTop (true);
+        keyWin->centreAroundComponent (this, keyWin->getWidth(), keyWin->getHeight());
+    }
+    keyWin->setVisible (true);
+    keyWin->toFront (true);
 }
 
 void RetuneEditor::updateScale()
@@ -502,26 +848,34 @@ void RetuneEditor::timerCallback()
     {
         case RetuneProcessor::Analysing: s = "Analysing..."; break;
         case RetuneProcessor::Rendering: s = "Rendering..."; break;
-        case RetuneProcessor::Ready:     s = "Ready - edits play back with the transport"; break;
+        case RetuneProcessor::Ready:     s = "Ready"; break;
         default:                         s = "Empty"; break;
     }
     statusLabel.setText (s, juce::dontSendNotification);
 }
 
-void RetuneEditor::paint (juce::Graphics& g) { g.fillAll (kPanel); }
+void RetuneEditor::paint (juce::Graphics& g)
+{
+    g.fillAll (Theme::panel);
+    g.setColour (Theme::border);
+    g.fillRect (0, 47, getWidth(), 1);
+}
 
 void RetuneEditor::resized()
 {
     auto b = getLocalBounds();
-    auto bar = b.removeFromTop (44).reduced (8, 8);
-    recBtn.setBounds   (bar.removeFromLeft (90));   bar.removeFromLeft (14);
-    editBtn.setBounds  (bar.removeFromLeft (60));
-    splitBtn.setBounds (bar.removeFromLeft (60));   bar.removeFromLeft (14);
-    undoBtn.setBounds  (bar.removeFromLeft (60));   bar.removeFromLeft (14);
-    keyBox.setBounds   (bar.removeFromLeft (64));   bar.removeFromLeft (6);
-    scaleBox.setBounds (bar.removeFromLeft (140));  bar.removeFromLeft (6);
-    snapBtn.setBounds  (bar.removeFromLeft (110));  bar.removeFromLeft (14);
-    clearBtn.setBounds (bar.removeFromLeft (60));
+    auto bar = b.removeFromTop (48).reduced (10, 9);
+    const int gap = 8;
+    recBtn.setBounds   (bar.removeFromLeft (92));   bar.removeFromLeft (gap + 6);
+    editBtn.setBounds  (bar.removeFromLeft (58));   bar.removeFromLeft (4);
+    splitBtn.setBounds (bar.removeFromLeft (58));   bar.removeFromLeft (gap);
+    undoBtn.setBounds  (bar.removeFromLeft (58));   bar.removeFromLeft (gap + 6);
+    keyBox.setBounds   (bar.removeFromLeft (64));   bar.removeFromLeft (gap);
+    scaleBox.setBounds (bar.removeFromLeft (140));  bar.removeFromLeft (gap);
+    snapBtn.setBounds  (bar.removeFromLeft (108));  bar.removeFromLeft (gap + 6);
+    airBtn.setBounds   (bar.removeFromLeft (54));   bar.removeFromLeft (gap);
+    keysBtn.setBounds  (bar.removeFromLeft (78));   bar.removeFromLeft (gap);
+    clearBtn.setBounds (bar.removeFromLeft (58));
     statusLabel.setBounds (bar);
-    noteEditor.setBounds (b);
+    noteEditor.setBounds (b.withTrimmedTop (1));
 }

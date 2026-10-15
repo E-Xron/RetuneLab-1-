@@ -1,6 +1,7 @@
 #pragma once
 #include <functional>
 #include "PluginProcessor.h"
+#include "Look.h"
 
 class NoteEditor : public juce::Component, private juce::Timer
 {
@@ -19,15 +20,22 @@ public:
 
     void setTool (Tool t) { tool = t; repaint(); }
     void setScaleMask (int m) { scaleMask = m; repaint(); }
+    void perform (Act);
     void undo();
     void snapToScale();
+    void snapSemitone();
     void selectAll();
     void deleteSelected();
+    void mergeSelected();
+    void resetSelected();
+    void splitAtPlayhead();
     void fitView();
+
+    std::function<void (Act)> onExtraAction;       // record / tool switching, handled by the editor
 
 private:
     enum Zone { None, Body, LeftEdge, RightEdge };
-    static constexpr float kKeyW = 56.f;
+    static constexpr float kKeyW = 56.f, kRuler = 16.f;
 
     void timerCallback() override;
     double sr() const { return proc.getSr(); }
@@ -36,6 +44,7 @@ private:
     double sampleFromX (float x) const { return ((x - kKeyW) / pps + scrollSec) * sr(); }
     float yFromMidi (float m) const { return (float) ((topMidi - m) * rowH); }
     float midiFromY (float y) const { return (float) (topMidi - y / rowH); }
+    juce::Rectangle<float> noteRect (const Note&) const;
 
     int  hitNote (juce::Point<float>, const std::vector<Note>&, Zone&) const;
     void pushUndo (const std::vector<Note>&);
@@ -59,23 +68,76 @@ private:
     int dragIdx = -1;
     Zone dragZone = None;
     bool didDrag = false;
+
+    bool marquee = false;                         // drag-to-select rectangle
+    juce::Point<float> marqueeStart;
+    juce::Rectangle<float> marqueeRect;
+    std::vector<bool> marqueeBase;
+};
+
+// ---- small floating windows -------------------------------------------------------------
+class ToolWindow : public juce::DocumentWindow
+{
+public:
+    explicit ToolWindow (const juce::String& name)
+        : juce::DocumentWindow (name, Theme::panel, juce::DocumentWindow::closeButton) {}
+    void closeButtonPressed() override { setVisible (false); }
+};
+
+class AirPanel : public juce::Component
+{
+public:
+    explicit AirPanel (RetuneProcessor&);
+    void paint (juce::Graphics&) override;
+    void resized() override;
+private:
+    juce::Slider mid, high;
+    juce::Label midL, highL;
+    juce::ToggleButton on { "Enabled" };
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> aMid, aHigh;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> aOn;
+};
+
+class HotkeyPanel : public juce::Component
+{
+public:
+    explicit HotkeyPanel (RetuneProcessor&);
+    void paint (juce::Graphics&) override;
+    void resized() override;
+    bool keyPressed (const juce::KeyPress&) override;
+private:
+    void refresh();
+    RetuneProcessor& proc;
+    std::array<juce::TextButton, (size_t) HotkeyMap::N> btns;
+    std::array<juce::Label, (size_t) HotkeyMap::N> labels;
+    juce::TextButton resetBtn { "Reset to defaults" };
+    int capturing = -1;
 };
 
 class RetuneEditor : public juce::AudioProcessorEditor, private juce::Timer
 {
 public:
     explicit RetuneEditor (RetuneProcessor&);
+    ~RetuneEditor() override;
     void paint (juce::Graphics&) override;
     void resized() override;
+    bool keyPressed (const juce::KeyPress& k) override { return noteEditor.keyPressed (k); }
 
 private:
     void timerCallback() override;
     void updateScale();
+    void showAir();
+    void showHotkeys();
+    void toggleRecord();
+    void selectTool (bool split);
 
+    ModernLAF laf;                                   // must outlive everything below
     RetuneProcessor& proc;
     NoteEditor noteEditor;
     juce::TextButton recBtn { "Record" }, editBtn { "Edit" }, splitBtn { "Split" },
-                     undoBtn { "Undo" }, snapBtn { "Snap to scale" }, clearBtn { "Clear" };
+                     undoBtn { "Undo" }, snapBtn { "Snap to scale" }, clearBtn { "Clear" },
+                     airBtn { "Air" }, keysBtn { "Hotkeys" };
     juce::ComboBox keyBox, scaleBox;
     juce::Label statusLabel;
+    std::unique_ptr<ToolWindow> airWin, keyWin;
 };

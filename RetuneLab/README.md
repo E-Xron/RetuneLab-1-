@@ -11,6 +11,8 @@ Editing
 - Split tool (or right-click > Split here): cut a note at the cursor. Right-click > Merge joins with the next note.
 - Click selects; Ctrl/Cmd-click adds to the selection; Ctrl/Cmd+A selects all; Delete mutes; Ctrl/Cmd+Z undoes.
 - Snap to scale: moves selected notes (or all) to the nearest note of the chosen key/scale.
+- Drag on empty space to draw a selection rectangle (hold Ctrl/Cmd or Shift to add to the selection).
+- Hotkeys button: choose your own keyboard shortcuts. Air button: Mid Air / High Air controls for vocal sheen.
 - Wheel: scroll pitch. Shift+wheel: scroll time. Ctrl/Cmd+wheel: zoom time.
 
 Build
