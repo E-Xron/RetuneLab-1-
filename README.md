@@ -1,5 +1,5 @@
 **RETUNELAB**
-Free vocal tuner/processor
+Free vocal tuner/processor **Ableton Only Right Now**
 
 Available for download in .vst3 format right now
 
