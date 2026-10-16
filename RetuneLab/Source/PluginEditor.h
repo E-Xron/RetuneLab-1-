@@ -3,6 +3,22 @@
 #include "PluginProcessor.h"
 #include "Look.h"
 
+// ---- scale tables shared by the note editor and the toolbar
+inline const juce::StringArray& scaleNames()
+{
+    static const juce::StringArray n { "Major", "Minor", "Chromatic", "Major Pentatonic", "Minor Pentatonic", "Blues" };
+    return n;
+}
+inline int scaleMaskFor (int root, int scale)
+{
+    static const std::vector<std::vector<int>> deg {
+        { 0,2,4,5,7,9,11 }, { 0,2,3,5,7,8,10 }, { 0,1,2,3,4,5,6,7,8,9,10,11 },
+        { 0,2,4,7,9 }, { 0,3,5,7,10 }, { 0,3,5,6,7,10 } };
+    int mask = 0;
+    for (int d : deg[(size_t) juce::jlimit (0, (int) deg.size() - 1, scale)]) mask |= 1 << ((d + root) % 12);
+    return mask;
+}
+
 class NoteEditor : public juce::Component, private juce::Timer
 {
 public:
@@ -19,7 +35,7 @@ public:
     bool keyPressed (const juce::KeyPress&) override;
 
     void setTool (Tool t) { tool = t; repaint(); }
-    void setScaleMask (int m) { scaleMask = m; repaint(); }
+    void snapAll (bool toScale);                  // every note, regardless of selection
     void perform (Act);
     void undo();
     void snapToScale();
@@ -59,7 +75,8 @@ private:
     Tool tool = Tool::Edit;
     ClipAnalysis analysisCache;
     int lastVersion = -1;
-    int scaleMask = 2741;                         // C major
+    bool keyDrag = false, keyPaintState = true;   // painting allowed notes on the keyboard strip
+    int pitchClassAtY (float y) const { return ((((int) std::floor (midiFromY (y) + 0.5f)) % 12) + 12) % 12; }
     double scrollSec = 0.0, pps = 100.0, rowH = 16.0, topMidi = 84.0;
     float hoverX = -1.f;
 
@@ -135,7 +152,7 @@ private:
     RetuneProcessor& proc;
     NoteEditor noteEditor;
     juce::TextButton recBtn { "Record" }, editBtn { "Edit" }, splitBtn { "Split" },
-                     undoBtn { "Undo" }, snapBtn { "Snap to scale" }, clearBtn { "Clear" },
+                     undoBtn { "Undo" }, snapBtn { "Snap all: Scale" }, snapSemiBtn { "Snap all: Semitone" }, clearBtn { "Clear" },
                      airBtn { "Air" }, keysBtn { "Hotkeys" };
     juce::ComboBox keyBox, scaleBox;
     juce::Label statusLabel;

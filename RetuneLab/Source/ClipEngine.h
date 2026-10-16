@@ -28,6 +28,8 @@ namespace ClipEngine
 {
     float medianPitch (const ClipAnalysis&, int a, int b);                     // NaN if no voiced frames
     void  analyse (const std::vector<float>& mono, double sr, ClipAnalysis&, std::vector<Note>&);
+    // Krumhansl-Schmuckler key estimate from the detected notes (root 0-11, minor flag). Leaves the outputs alone if no notes.
+    void  detectKey (const std::vector<Note>&, int& root, bool& minor);
     // TD-PSOLA render of all notes (pitch shift + time stretch) plus the untouched residual.
     void  render (const float* const* src, int nch, int len, double sr,
                   const std::vector<Note>&, const ClipAnalysis&, std::vector<std::vector<float>>& out);

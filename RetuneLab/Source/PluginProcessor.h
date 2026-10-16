@@ -38,7 +38,9 @@ public:
 
     // ---- control API (message thread) ----
     void setRecording (bool on);
-    void clearClip();
+    void clearClip();                           // undoable with undoClear()
+    bool undoClear();
+    bool canUndoClear() const;
     void requestRender();
     std::vector<Note> getNotes() const;
     ClipAnalysis getAnalysis() const;
@@ -55,27 +57,38 @@ public:
     std::atomic<bool>        hostPlaying { false };
     std::atomic<int>         status { Idle };
     std::atomic<int>         analysisVersion { 0 };
+
+    // active key: root 0-11, scale index (0 major, 1 minor, ...), and the set of allowed pitch classes
+    std::atomic<int>  keyRoot { 0 }, keyScale { 0 }, noteMask { 2741 };
+    std::atomic<bool> keyPending { false };      // set after a fresh analysis: UI should auto-detect the key
+
     double getSr() const { return sr.load(); }
 
 private:
     class Worker;
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
+    void doAnalyse();
+    void doRender();
+
     AirFx airFx;
     std::atomic<float>* airOnP = nullptr;
     std::atomic<float>* midAirP = nullptr;
     std::atomic<float>* highAirP = nullptr;
-    void doAnalyse();
-    void doRender();
 
     std::atomic<double> sr { 48000.0 };
     std::array<std::vector<float>, 2> source;                 // recorded clip (fixed capacity, ~60 s)
     std::array<std::array<std::vector<float>, 2>, 3> renderBuf;   // triple buffer of rendered audio
     std::atomic<int> activeBuf { -1 }, retiredBuf { -1 };
-    bool originSet = false;                                   // audio thread only
+
+    // audio thread only
+    bool originSet = false;
+    int lastBuf = -1, fadeFrom = -1, fadeLeft = 0;
+    static constexpr int kFade = 480;                         // ~10 ms crossfade when a new render goes live
 
     mutable juce::CriticalSection modelLock;
     std::vector<Note> notes;
     ClipAnalysis analysis;
+    struct Cleared { std::vector<Note> notes; ClipAnalysis analysis; int len = 0; juce::int64 origin = 0; bool valid = false; } cleared;
 
     std::atomic<bool> needAnalyse { false }, needRender { false };
     std::unique_ptr<Worker> worker;

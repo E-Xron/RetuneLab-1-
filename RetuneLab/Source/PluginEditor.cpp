@@ -35,6 +35,18 @@ void NoteEditor::timerCallback()
         analysisCache = proc.getAnalysis();
         undoStack.clear();
         fitView();
+        if (proc.keyPending.exchange (false))                 // fresh recording: work out the key from what was sung
+        {
+            const auto nv = proc.getNotes();
+            if (! nv.empty())
+            {
+                int root = 0; bool minor = false;
+                ClipEngine::detectKey (nv, root, minor);
+                proc.keyRoot = root;
+                proc.keyScale = minor ? 1 : 0;
+                proc.noteMask = scaleMaskFor (root, minor ? 1 : 0);
+            }
+        }
     }
     repaint();
 }
@@ -80,6 +92,7 @@ void NoteEditor::paint (juce::Graphics& g)
     using namespace Theme;
     g.fillAll (bg);
     const auto roll = rollArea();
+    const int scaleMask = proc.noteMask.load();
 
     // ---- pitch rows + keyboard
     const int topN = (int) std::ceil (topMidi + 0.5), botN = (int) std::floor (midiFromY ((float) getHeight()) - 0.5f);
@@ -98,11 +111,13 @@ void NoteEditor::paint (juce::Graphics& g)
         g.fillRect (roll.getX(), y0 + (float) rowH - 1.f, roll.getWidth(), 1.f);
 
         juce::Rectangle<float> k (0.f, y0, kKeyW, (float) rowH);
-        g.setColour (blk ? juce::Colour (0xff1b1f27) : juce::Colour (0xffdfe3ea));
+        juce::Colour kc = blk ? juce::Colour (0xff1b1f27) : juce::Colour (0xffdfe3ea);
+        if (inScale) kc = kc.interpolatedWith (accent, blk ? 0.5f : 0.42f);      // active notes light up on the keyboard
+        g.setColour (kc);
         g.fillRect (k.withTrimmedBottom (1.f));
         if (inScale)
         {
-            g.setColour (accent);
+            g.setColour (juce::Colours::white);
             g.fillEllipse (k.getRight() - 11.f, k.getCentreY() - 2.5f, 5.f, 5.f);
         }
         if (pc == 0)
@@ -259,6 +274,7 @@ void NoteEditor::pushUndo (const std::vector<Note>& v)
 void NoteEditor::mouseMove (const juce::MouseEvent& e)
 {
     hoverX = e.position.x;
+    if (e.position.x < kKeyW) { setMouseCursor (juce::MouseCursor::PointingHandCursor); return; }
     auto v = proc.getNotes();
     Zone z;
     const int idx = hitNote (e.position, v, z);
@@ -272,6 +288,16 @@ void NoteEditor::mouseMove (const juce::MouseEvent& e)
 void NoteEditor::mouseDown (const juce::MouseEvent& e)
 {
     grabKeyboardFocus();
+    if (e.position.x < kKeyW && ! e.mods.isPopupMenu())      // keyboard strip: switch pitch classes on / off
+    {
+        const int pc = pitchClassAtY (e.position.y);
+        const int m = proc.noteMask.load();
+        keyPaintState = ((m >> pc) & 1) == 0;
+        keyDrag = true;
+        proc.noteMask = keyPaintState ? (m | (1 << pc)) : (m & ~(1 << pc));
+        repaint();
+        return;
+    }
     auto v = proc.getNotes();
     Zone z;
     const int idx = hitNote (e.position, v, z);
@@ -321,6 +347,14 @@ void NoteEditor::mouseDown (const juce::MouseEvent& e)
 
 void NoteEditor::mouseDrag (const juce::MouseEvent& e)
 {
+    if (keyDrag)
+    {
+        const int pc = pitchClassAtY (e.position.y);
+        const int m = proc.noteMask.load();
+        proc.noteMask = keyPaintState ? (m | (1 << pc)) : (m & ~(1 << pc));
+        repaint();
+        return;
+    }
     if (marquee)
     {
         marqueeRect = juce::Rectangle<float> (marqueeStart, e.position);
@@ -375,6 +409,7 @@ void NoteEditor::mouseDrag (const juce::MouseEvent& e)
 
 void NoteEditor::mouseUp (const juce::MouseEvent&)
 {
+    if (keyDrag) { keyDrag = false; return; }
     if (marquee) { marquee = false; repaint(); return; }
     if (dragIdx < 0) return;
     if (didDrag) proc.requestRender();
@@ -471,6 +506,7 @@ bool NoteEditor::mergeNext (std::vector<Note>& v, int idx)
 
 float NoteEditor::nearestInScale (float t) const
 {
+    const int scaleMask = proc.noteMask.load();
     if (scaleMask == 0) return t;
     float best = t, bestD = 1e9f;
     const int c = (int) std::round (t);
@@ -545,6 +581,15 @@ void NoteEditor::snapSemitone()
     commit (v);
 }
 
+void NoteEditor::snapAll (bool toScale)
+{
+    auto v = proc.getNotes();
+    if (v.empty()) return;
+    pushUndo (v);
+    for (auto& n : v) n.targetMid = toScale ? nearestInScale (snapBase (n)) : std::round (snapBase (n));
+    commit (v);
+}
+
 void NoteEditor::selectAll()
 {
     auto v = proc.getNotes();
@@ -604,7 +649,7 @@ void NoteEditor::splitAtPlayhead()
 
 void NoteEditor::undo()
 {
-    if (undoStack.empty()) return;
+    if (undoStack.empty()) { proc.undoClear(); return; }      // nothing to step back: bring back a cleared clip
     commit (undoStack.back());
     undoStack.pop_back();
 }
@@ -682,7 +727,7 @@ HotkeyPanel::HotkeyPanel (RetuneProcessor& p) : proc (p)
     resetBtn.onClick = [this] { proc.hotkeys.resetDefaults(); capturing = -1; refresh(); };
     addAndMakeVisible (resetBtn);
     refresh();
-    setSize (440, 500);
+    setSize (440, 540);
 }
 
 void HotkeyPanel::refresh()
@@ -724,10 +769,6 @@ void HotkeyPanel::resized()
 }
 
 // ===================================================================== RetuneEditor
-static const juce::StringArray kScaleNames { "Major", "Minor", "Chromatic", "Major Pentatonic", "Minor Pentatonic", "Blues" };
-static const std::vector<std::vector<int>> kScaleDegrees {
-    { 0,2,4,5,7,9,11 }, { 0,2,3,5,7,8,10 }, { 0,1,2,3,4,5,6,7,8,9,10,11 },
-    { 0,2,4,7,9 }, { 0,3,5,7,10 }, { 0,3,5,6,7,10 } };
 
 RetuneEditor::RetuneEditor (RetuneProcessor& p)
     : AudioProcessorEditor (&p), proc (p), noteEditor (p)
@@ -745,18 +786,19 @@ RetuneEditor::RetuneEditor (RetuneProcessor& p)
     editBtn.onClick  = [this] { noteEditor.setTool (NoteEditor::Tool::Edit); };
     splitBtn.onClick = [this] { noteEditor.setTool (NoteEditor::Tool::Split); };
     undoBtn.onClick  = [this] { noteEditor.undo(); };
-    snapBtn.onClick  = [this] { noteEditor.snapToScale(); };
+    snapBtn.onClick  = [this] { noteEditor.snapAll (true); };
+    snapSemiBtn.onClick = [this] { noteEditor.snapAll (false); };
     clearBtn.onClick = [this] { proc.clearClip(); };
     airBtn.onClick   = [this] { showAir(); };
     keysBtn.onClick  = [this] { showHotkeys(); };
 
     keyBox.addItemList ({ "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" }, 1);
-    scaleBox.addItemList (kScaleNames, 1);
-    keyBox.setSelectedItemIndex (0, juce::dontSendNotification);
-    scaleBox.setSelectedItemIndex (0, juce::dontSendNotification);
+    scaleBox.addItemList (scaleNames(), 1);
+    keyBox.setSelectedItemIndex (proc.keyRoot.load(), juce::dontSendNotification);
+    scaleBox.setSelectedItemIndex (proc.keyScale.load(), juce::dontSendNotification);
     keyBox.onChange = scaleBox.onChange = [this] { updateScale(); };
 
-    for (auto* c : std::initializer_list<juce::Component*> { &recBtn, &editBtn, &splitBtn, &undoBtn, &snapBtn, &clearBtn,
+    for (auto* c : std::initializer_list<juce::Component*> { &recBtn, &editBtn, &splitBtn, &undoBtn, &snapBtn, &snapSemiBtn, &clearBtn,
                                                               &airBtn, &keysBtn, &keyBox, &scaleBox, &statusLabel })
     {
         c->setWantsKeyboardFocus (false);           // keep keyboard shortcuts flowing to the note editor
@@ -770,11 +812,12 @@ RetuneEditor::RetuneEditor (RetuneProcessor& p)
         if (a == Act::Record)    toggleRecord();
         if (a == Act::EditTool)  selectTool (false);
         if (a == Act::SplitTool) selectTool (true);
+        if (a == Act::Clear)     proc.clearClip();
     };
 
     setResizable (true, true);
-    setResizeLimits (900, 480, 1800, 1100);
-    setSize (1040, 660);
+    setResizeLimits (1060, 480, 1900, 1100);
+    setSize (1180, 660);
     startTimerHz (10);
 }
 
@@ -832,14 +875,18 @@ void RetuneEditor::showHotkeys()
 void RetuneEditor::updateScale()
 {
     const int key = keyBox.getSelectedItemIndex();
-    const int sc = juce::jlimit (0, (int) kScaleDegrees.size() - 1, scaleBox.getSelectedItemIndex());
-    int mask = 0;
-    for (int d : kScaleDegrees[(size_t) sc]) mask |= 1 << ((d + key) % 12);
-    noteEditor.setScaleMask (mask);
+    const int sc = juce::jlimit (0, scaleNames().size() - 1, scaleBox.getSelectedItemIndex());
+    proc.keyRoot = key;
+    proc.keyScale = sc;
+    proc.noteMask = scaleMaskFor (key, sc);        // changing the key or scale resets the active notes to exactly that scale
 }
 
 void RetuneEditor::timerCallback()
 {
+    if (keyBox.getSelectedItemIndex() != proc.keyRoot.load())
+        keyBox.setSelectedItemIndex (proc.keyRoot.load(), juce::dontSendNotification);      // follows auto-detected key
+    if (scaleBox.getSelectedItemIndex() != proc.keyScale.load())
+        scaleBox.setSelectedItemIndex (proc.keyScale.load(), juce::dontSendNotification);
     recBtn.setToggleState (proc.recordArmed.load(), juce::dontSendNotification);
     juce::String s;
     if (proc.recordArmed.load())
@@ -872,7 +919,8 @@ void RetuneEditor::resized()
     undoBtn.setBounds  (bar.removeFromLeft (58));   bar.removeFromLeft (gap + 6);
     keyBox.setBounds   (bar.removeFromLeft (64));   bar.removeFromLeft (gap);
     scaleBox.setBounds (bar.removeFromLeft (140));  bar.removeFromLeft (gap);
-    snapBtn.setBounds  (bar.removeFromLeft (108));  bar.removeFromLeft (gap + 6);
+    snapBtn.setBounds  (bar.removeFromLeft (118));  bar.removeFromLeft (4);
+    snapSemiBtn.setBounds (bar.removeFromLeft (138)); bar.removeFromLeft (gap + 6);
     airBtn.setBounds   (bar.removeFromLeft (54));   bar.removeFromLeft (gap);
     keysBtn.setBounds  (bar.removeFromLeft (78));   bar.removeFromLeft (gap);
     clearBtn.setBounds (bar.removeFromLeft (58));

@@ -97,21 +97,40 @@ void RetuneProcessor::processBlock (juce::AudioBuffer<float>& buf, juce::MidiBuf
         }
         const juce::int64 endIdx = juce::jmin (cap, pos + n - o);
         if (endIdx > (juce::int64) clipLen.load()) clipLen.store ((int) endIdx);
+        lastBuf = -1; fadeLeft = 0; fadeFrom = -1;
     }
     else
     {
         const int ai = activeBuf.load (std::memory_order_acquire);   // ---- playback of the edited clip
         if (! rec && playing && havePos && ai >= 0)
         {
+            if (ai != lastBuf)                                       // a new render just went live: blend from the old one
+            {
+                fadeFrom = (lastBuf >= 0 && lastBuf == retiredBuf.load()) ? lastBuf : -1;
+                fadeLeft = fadeFrom >= 0 ? kFade : 0;
+                lastBuf = ai;
+            }
             const auto& rb = renderBuf[(size_t) ai];
+            const std::array<std::vector<float>, 2>* ob = fadeFrom >= 0 ? &renderBuf[(size_t) fadeFrom] : nullptr;
             const juce::int64 len = (juce::int64) rb[0].size(), o = clipOrigin.load();
             for (int i = 0; i < n; ++i)
             {
                 const juce::int64 idx = pos + i - o;
-                if (idx < 0 || idx >= len) continue;               // outside the clip: dry input
-                for (int c = 0; c < nch; ++c) buf.setSample (c, i, rb[(size_t) c][(size_t) idx]);
+                if (idx >= 0 && idx < len)                           // outside the clip: dry input
+                    for (int c = 0; c < nch; ++c)
+                    {
+                        float v = rb[(size_t) c][(size_t) idx];
+                        if (fadeLeft > 0 && ob != nullptr && idx < (juce::int64) (*ob)[0].size())
+                        {
+                            const float f = (float) fadeLeft / (float) kFade;
+                            v = v * (1.f - f) + (*ob)[(size_t) c][(size_t) idx] * f;
+                        }
+                        buf.setSample (c, i, v);
+                    }
+                if (fadeLeft > 0) --fadeLeft;
             }
         }
+        else { lastBuf = -1; fadeLeft = 0; fadeFrom = -1; }
     }
 
     airFx.process (buf, airOnP->load() > 0.5f, midAirP->load(), highAirP->load());
@@ -133,6 +152,7 @@ void RetuneProcessor::doAnalyse()
         notes = std::move (nts);
         analysis = std::move (an);
     }
+    keyPending = true;
     ++analysisVersion;
 }
 
@@ -150,6 +170,7 @@ void RetuneProcessor::doRender()
     std::vector<std::vector<float>> out;
     ClipEngine::render (ptrs, 2, len, sr.load(), nts, an, out);
 
+    if (clipLen.load() <= 0) { status = Idle; return; }      // the clip was cleared while we were rendering
     const int a = activeBuf.load(), r = retiredBuf.load();
     int pick = 0;
     for (int i = 0; i < 3; ++i) if (i != a && i != r) { pick = i; break; }
@@ -165,7 +186,7 @@ void RetuneProcessor::setRecording (bool on)
 {
     if (on)
     {
-        { juce::ScopedLock sl (modelLock); notes.clear(); analysis = {}; }
+        { juce::ScopedLock sl (modelLock); notes.clear(); analysis = {}; cleared.valid = false; }   // new audio overwrites the old clip
         activeBuf.store (-1);
         clipLen.store (0);
         ++analysisVersion;
@@ -184,11 +205,41 @@ void RetuneProcessor::clearClip()
 {
     recordArmed.store (false);
     activeBuf.store (-1);
-    { juce::ScopedLock sl (modelLock); notes.clear(); analysis = {}; }
+    {
+        juce::ScopedLock sl (modelLock);
+        if (clipLen.load() > 0)                                 // keep everything so Undo can bring it back
+        {
+            cleared.notes = notes;
+            cleared.analysis = analysis;
+            cleared.len = clipLen.load();
+            cleared.origin = clipOrigin.load();
+            cleared.valid = true;
+        }
+        notes.clear();
+        analysis = {};
+    }
     clipLen.store (0);
     ++analysisVersion;
     status = Idle;
 }
+
+bool RetuneProcessor::undoClear()
+{
+    {
+        juce::ScopedLock sl (modelLock);
+        if (! cleared.valid) return false;
+        notes = cleared.notes;
+        analysis = cleared.analysis;
+        clipLen.store (cleared.len);
+        clipOrigin.store (cleared.origin);
+        cleared.valid = false;
+    }
+    ++analysisVersion;
+    requestRender();
+    return true;
+}
+
+bool RetuneProcessor::canUndoClear() const { juce::ScopedLock sl (modelLock); return cleared.valid; }
 
 void RetuneProcessor::requestRender() { needRender = true; worker->notify(); }
 
@@ -202,7 +253,7 @@ void RetuneProcessor::getStateInformation (juce::MemoryBlock& dest)
     juce::MemoryOutputStream o (dest, false);
     juce::ScopedLock sl (modelLock);
     const int len = juce::jmin (clipLen.load(), (int) source[0].size());
-    o.writeInt (0x52544c31);
+    o.writeInt (0x52544c32);
     o.writeDouble (sr.load());
     o.writeInt64 (clipOrigin.load());
     o.writeInt (len);
@@ -217,6 +268,7 @@ void RetuneProcessor::getStateInformation (juce::MemoryBlock& dest)
     }
     o.writeInt (analysis.hop); o.writeInt (analysis.frameOffset); o.writeInt ((int) analysis.contour.size());
     for (float f : analysis.contour) o.writeFloat (f);
+    o.writeInt (noteMask.load()); o.writeInt (keyRoot.load()); o.writeInt (keyScale.load());
     if (auto xml = apvts.copyState().createXml()) o.writeString (xml->toString()); else o.writeString ({});
 }
 
@@ -224,7 +276,9 @@ void RetuneProcessor::setStateInformation (const void* data, int size)
 {
     if (size < 32) return;
     juce::MemoryInputStream in (data, (size_t) size, false);
-    if (in.readInt() != 0x52544c31) return;
+    const int magic = in.readInt();
+    if (magic != 0x52544c31 && magic != 0x52544c32) return;
+    const bool v2 = (magic == 0x52544c32);                    // v2 also stores the key
     in.readDouble();
     const juce::int64 origin = in.readInt64();
     const int len = juce::jmin (in.readInt(), (int) source[0].size());
@@ -242,6 +296,10 @@ void RetuneProcessor::setStateInformation (const void* data, int size)
     an.hop = in.readInt(); an.frameOffset = in.readInt();
     an.contour.resize ((size_t) juce::jmax (0, in.readInt()));
     for (auto& f : an.contour) f = in.readFloat();
+    if (v2)
+    {
+        noteMask.store (in.readInt()); keyRoot.store (in.readInt()); keyScale.store (in.readInt());
+    }
     if (! in.isExhausted())
         if (auto xml = juce::XmlDocument::parse (in.readString()))
             apvts.replaceState (juce::ValueTree::fromXml (*xml));
@@ -250,9 +308,11 @@ void RetuneProcessor::setStateInformation (const void* data, int size)
         juce::ScopedLock sl (modelLock);
         notes = std::move (nts);
         analysis = std::move (an);
+        cleared.valid = false;
     }
     clipOrigin.store (origin);
     clipLen.store (len);
+    keyPending = false;
     ++analysisVersion;
     requestRender();
 }

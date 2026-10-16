@@ -4,7 +4,7 @@
 #include <array>
 
 enum class Act { Undo = 0, SelectAll, Delete, SnapScale, SnapSemitone, Merge, Reset, SplitAtPlayhead,
-                 EditTool, SplitTool, Record, FitView, Count, None };
+                 EditTool, SplitTool, Record, FitView, Clear, Count, None };
 
 // User-configurable shortcuts, stored in a settings file shared by every RetuneLab instance.
 class HotkeyMap
@@ -16,12 +16,12 @@ public:
     {
         static const char* names[N] = { "Undo", "Select all", "Delete / restore notes", "Snap to scale", "Snap to semitone",
                                         "Merge with next note", "Reset notes", "Split at playhead", "Edit tool",
-                                        "Split tool", "Record on/off", "Fit view" };
+                                        "Split tool", "Record on/off", "Fit view", "Clear clip (undoable)" };
         return names[i];
     }
     static juce::String defaultDesc (int i)
     {
-        static const char* d[N] = { "command + Z", "command + A", "delete", "Q", "W", "J", "X", "K", "E", "S", "R", "F" };
+        static const char* d[N] = { "command + Z", "command + A", "delete", "Q", "W", "J", "X", "K", "E", "S", "R", "F", "shift + delete" };
         return d[i];
     }
 
