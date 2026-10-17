@@ -281,6 +281,7 @@ public:
             if (k.id != nullptr)
             {
                 atts.add (new juce::AudioProcessorValueTreeState::SliderAttachment (proc.apvts, k.id, *s));
+                s->onDragStart = [this] { powerOn(); };
                 if (auto* prm = proc.apvts.getParameter (k.id))
                     s->setDoubleClickReturnValue (true, prm->convertFrom0to1 (prm->getDefaultValue()));
             }
@@ -289,11 +290,12 @@ public:
                 const int field = k.field;
                 s->setRange (k.lo, k.hi, 0.0);
                 s->setDoubleClickReturnValue (true, k.def);
-                s->onDragStart = [this] { dragging = true; editor.beginShapeEdit(); };
+                s->onDragStart = [this] { powerOn(); dragging = true; editor.beginShapeEdit(); };
                 s->onDragEnd   = [this] { dragging = false; editor.endShapeEdit(); };
                 s->onValueChange = [this, s, field]
                 {
                     if (dragging) { editor.setShape (field, (float) s->getValue()); return; }
+                    powerOn();
                     editor.beginShapeEdit();               // typed value or double-click reset
                     editor.setShape (field, (float) s->getValue());
                     editor.endShapeEdit();
@@ -327,6 +329,10 @@ public:
     }
 
     void flash() { glow = 1.f; }
+    void setMaxCell (int w) { maxCell = w; resized(); }
+    int numKnobs() const { return knobs.size(); }
+    juce::String knobText (int i) const { return knobs[i]->getTextFromValue (knobs[i]->getValue()); }
+    bool extraOn() const { return extra != nullptr && extra->getToggleState(); }
 
     void tick()
     {
@@ -349,7 +355,10 @@ public:
             int targets = 0;
             for (int i = 0; i < knobs.size(); ++i)
                 if (fields[(size_t) i] >= 0)
-                    knobs[i]->setValue (editor.shapeValue (fields[(size_t) i], targets), juce::dontSendNotification);
+                {
+                    const float v = editor.shapeValue (fields[(size_t) i], targets);
+                    if (targets > 0) knobs[i]->setValue (v, juce::dontSendNotification);   // no notes yet: keep the knob where it is
+                }
             noteTargets = targets;
         }
         glow = std::max (0.f, glow - 0.03f);
@@ -420,7 +429,7 @@ public:
         if (extra != nullptr) extra->setBounds (head.removeFromRight (130).withSizeKeepingCentre (130, 22));
         r.removeFromTop (6);
         const int knobRows = def.knobs.size() > 5 ? 2 : (def.knobs.empty() ? 0 : 1);
-        const int rowH = knobRows == 2 ? 88 : 96;
+        const int rowH = knobRows == 0 ? 0 : juce::jlimit (84, maxCell + 20, (r.getHeight() - 150) / knobRows);
         screen = r.removeFromTop (r.getHeight() - knobRows * rowH - (knobRows > 0 ? 8 : 0));
         r.removeFromTop (knobRows > 0 ? 8 : 0);
         const int n = knobs.size();
@@ -429,7 +438,7 @@ public:
         {
             const int row = i / juce::jmax (1, perRow), colI = i % juce::jmax (1, perRow);
             const int inRow = row == 0 ? juce::jmin (perRow, n) : n - perRow;
-            const int cw = juce::jmin (92, r.getWidth() / juce::jmax (1, perRow));
+            const int cw = juce::jmin (maxCell, r.getWidth() / juce::jmax (1, perRow));
             const int x0 = r.getX() + (r.getWidth() - inRow * cw) / 2;
             juce::Rectangle<int> cell (x0 + colI * cw, r.getY() + row * rowH, cw, rowH);
             labels[i]->setBounds (cell.removeFromTop (13));
@@ -442,6 +451,12 @@ private:
     {
         if (def.onId == nullptr) return true;
         return proc.apvts.getRawParameterValue (def.onId)->load() > 0.5f;
+    }
+    void powerOn()                     // touching a bypassed effect's knob switches the effect on
+    {
+        if (def.onId != nullptr)
+            if (auto* prm = proc.apvts.getParameter (def.onId))
+                if (prm->getValue() < 0.5f) prm->setValueNotifyingHost (1.f);
     }
     float pv (const char* id) const { return proc.apvts.getRawParameterValue (id)->load(); }
 
@@ -699,6 +714,7 @@ private:
     void paintVU (juce::Graphics& g, juce::Rectangle<float> r, bool on)
     {
         // classic cream VU face, reading gain reduction (0 at the right, -20 dB at the left)
+        r = r.withSizeKeepingCentre (std::min (r.getWidth(), r.getHeight() / 0.6f), std::min (r.getHeight(), r.getWidth() * 0.6f));
         g.setGradientFill (juce::ColourGradient (juce::Colour (on ? 0xfff6ecd0 : 0xffb8b2a2), r.getCentreX(), r.getY(),
                                                  juce::Colour (on ? 0xffe2cf9c : 0xff8f8a7d), r.getCentreX(), r.getBottom(), false));
         g.fillRoundedRectangle (r, 5.f);
@@ -804,7 +820,7 @@ private:
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> extraAtt;
     std::vector<int> fields;
     bool dragging = false;
-    int noteTargets = 0;
+    int noteTargets = 0, maxCell = 92;
     juce::Rectangle<int> screen;
     float mDeess = 0.f, mComp = 0.f, mCompIn = -60.f, mCompOut = -60.f, needle = 0.f, glow = 0.f;
     float mChoir[3] = { -60.f, -60.f, -60.f }, mIn[2] = { -60.f, -60.f }, mOut[2] = { -60.f, -60.f };
@@ -812,103 +828,582 @@ private:
     int holdTicks[2] = { 0, 0 };
 };
 
+// ===================================================================== descriptions
+namespace
+{
+    const char* moduleDesc (int i)
+    {
+        static const char* d[] = {
+            "Slides the pitch from the previous note into each note instead of jumping. Works on the selected notes, or on every note when none are selected.",
+            "Reshapes the pitch inside each note: the slow wander (drift) and the fast wobble (vibrato). Works on the selected notes, or on every note when none are selected.",
+            "Turns down harsh S, T and SH sounds only while they happen, leaving the rest of the voice untouched.",
+            "Adds presence and breathy top end so the vocal sits on top of the mix.",
+            "Evens out loud and quiet syllables like a smooth opto compressor, with automatic make-up gain.",
+            "Turns the vocal into a choir: basses an octave down, altos a third below in the current key, sopranos on the melody, all placed in a hall.",
+            "Adds two slightly detuned, delayed copies left and right for a wide, double-tracked sound.",
+            "Tempo-synced echoes that get darker with every repeat, like a tape delay.",
+            "Places the vocal in a room or plate space.",
+            "Input and output levels with peak hold. Use it to check the effects are not clipping.",
+        };
+        return d[juce::jlimit (0, 9, i)];
+    }
+
+    const char* knobHelp (int m, int k)
+    {
+        static const std::vector<std::vector<const char*>> h {
+            { "How long the slide into each note takes. 0 ms jumps straight to the note.",
+              "Shape of the slide: low is a straight line, high eases in and out like an S-curve." },
+            { "Slow pitch wander inside the note. 0% flat, 100% as sung, 200% exaggerated.",
+              "Vibrato depth. 0% removes it, 100% as sung, 200% doubles it." },
+            { "Level where de-essing starts. Lower catches more S sounds.",
+              "Where the S sound lives. Most voices sit between 5 and 8 kHz.",
+              "The most the S band is ever turned down." },
+            { "Presence around 3-6 kHz. Brings the voice forward.",
+              "Shelf above 10 kHz. Adds breath and sheen." },
+            { "Level above which the vocal gets levelled. Lower means more compression.",
+              "How hard loud parts are pulled down. 2:1 is gentle, 6:1 is firm.",
+              "How fast it reacts to a loud syllable.",
+              "How fast it lets go afterwards.",
+              "Blend of compressed and dry voice. Below 100% is parallel compression." },
+            { "Number of singers, from 3 to 16.",
+              "Share of the singers in the bass section.",
+              "Share of the singers in the alto section.",
+              "Share of the singers in the soprano section.",
+              "Choir level against the lead vocal.",
+              "Volume of the bass section.",
+              "Volume of the alto section.",
+              "Volume of the soprano section.",
+              "Size of the hall the choir sings in." },
+            { "How far left and right the doubles sit.",
+              "Pitch difference of the doubles, in cents. More sounds thicker.",
+              "Level of the doubles." },
+            { "Echo length, synced to the song tempo.",
+              "How many repeats. High values ring out for a long time.",
+              "Lower values make each repeat darker.",
+              "Level of the echoes." },
+            { "Room size and how long the tail lasts.",
+              "Darkens the tail like soft walls.",
+              "Stereo spread of the reverb.",
+              "Level of the reverb." },
+            {},
+        };
+        if (m < 0 || m >= (int) h.size() || k < 0 || k >= (int) h[(size_t) m].size()) return "";
+        return h[(size_t) m][(size_t) k];
+    }
+
+    // current value of a module's knob, formatted, read straight from the parameters / notes
+    juce::String knobValueText (RetuneProcessor& proc, NoteEditor& ed, const KnobDef& k)
+    {
+        if (k.id != nullptr)
+        {
+            if (auto* prm = dynamic_cast<juce::RangedAudioParameter*> (proc.apvts.getParameter (k.id)))
+                return formatValue (k.fmt, prm->convertFrom0to1 (prm->getValue()));
+            return {};
+        }
+        int t = 0;
+        const float v = ed.shapeValue (k.field, t);
+        return t > 0 ? formatValue (k.fmt, v) : juce::String ("-");
+    }
+
+    bool moduleOn (RetuneProcessor& proc, const ModuleDef& d)
+    {
+        return d.onId == nullptr || proc.apvts.getRawParameterValue (d.onId)->load() > 0.5f;
+    }
+
+    juce::String effectTitle (int i)
+    {
+        const juce::String n = modules()[(size_t) i].name;
+        return n.substring (0, 1) + n.substring (1).toLowerCase();
+    }
+
+    const int kChain[] = { 2, 4, 3, 5, 6, 7, 8 };                 // processing order of the vocal effects
+}
+
+// ===================================================================== overview card
+class dash::Card : public juce::Component
+{
+public:
+    Card (RetuneProcessor& p, NoteEditor& e, int i, KnobLook& look) : proc (p), editor (e), index (i), def (modules()[(size_t) i])
+    {
+        if (def.onId != nullptr)
+        {
+            power.getProperties().set ("power", true);
+            power.setColour (juce::ToggleButton::tickColourId, col (def.colour));
+            power.setLookAndFeel (&look);
+            power.setTooltip ("On / off");
+            addAndMakeVisible (power);
+            powerAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, def.onId, power);
+        }
+        openBtn.setButtonText ("Open  >");
+        openBtn.onClick = [this] { if (onOpen) onOpen (index); };
+        addAndMakeVisible (openBtn);
+        setMouseCursor (juce::MouseCursor::PointingHandCursor);
+    }
+
+    ~Card() override { powerAtt.reset(); power.setLookAndFeel (nullptr); }
+
+    std::function<void (int)> onOpen;
+
+    void mouseEnter (const juce::MouseEvent&) override { hover = true; repaint(); }
+    void mouseExit (const juce::MouseEvent&) override  { hover = false; repaint(); }
+    void mouseUp (const juce::MouseEvent& e) override  { if (e.mouseWasClicked() && onOpen) onOpen (index); }
+
+    void resized() override
+    {
+        auto r = getLocalBounds().reduced (14, 12);
+        power.setBounds (r.getX() + 6, r.getY(), 28, 28);
+        openBtn.setBounds (r.getRight() - 78, r.getY() + 1, 78, 26);
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const juce::Colour c = col (def.colour);
+        const bool on = moduleOn (proc, def);
+        auto r = getLocalBounds().toFloat().reduced (1.f);
+        g.setColour (juce::Colours::black.withAlpha (0.4f));
+        g.fillRoundedRectangle (r.translated (0.f, 2.f), 10.f);
+        g.setGradientFill (juce::ColourGradient (juce::Colour (0xff1d212a).interpolatedWith (c, hover ? 0.08f : 0.04f), 0.f, r.getY(),
+                                                 juce::Colour (0xff15181e), 0.f, r.getBottom(), false));
+        g.fillRoundedRectangle (r, 10.f);
+        g.setColour (c.withAlpha (hover ? 0.6f : (on ? 0.3f : 0.12f)));
+        g.drawRoundedRectangle (r, 10.f, 1.f);
+        g.setColour (c.withAlpha (on ? 0.95f : 0.25f));
+        g.fillRoundedRectangle (r.getX(), r.getY() + 14.f, 3.f, r.getHeight() - 28.f, 1.5f);
+
+        auto in = getLocalBounds().reduced (14, 12);
+        const int textX = in.getX() + (def.onId != nullptr ? 44 : 8);
+        const int textW = in.getRight() - 90 - textX;
+        g.setColour (Theme::text.withAlpha (on ? 1.f : 0.65f));
+        g.setFont (juce::FontOptions (14.5f, juce::Font::bold));
+        g.drawText (def.name, textX, in.getY(), textW, 16, juce::Justification::centredLeft);
+        g.setFont (juce::FontOptions (10.5f, juce::Font::bold));
+        g.setColour (on ? c : Theme::dim.withAlpha (0.7f));
+        g.drawText (def.onId == nullptr ? juce::String ("METERS") : (on ? juce::String ("ON") : juce::String ("BYPASSED")) + "   " + live(),
+                    textX, in.getY() + 16, textW, 13, juce::Justification::centredLeft);
+
+        g.setColour (Theme::dim);
+        g.setFont (juce::FontOptions (11.5f));
+        g.drawFittedText (moduleDesc (index), in.getX() + 8, in.getY() + 36, in.getWidth() - 16, 30, juce::Justification::topLeft, 2, 1.f);
+
+        // settings breakdown chips
+        float x = (float) in.getX() + 8.f;
+        const float y = (float) in.getBottom() - 22.f;
+        g.setFont (juce::FontOptions (10.5f, juce::Font::bold));
+        int shown = 0;
+        for (const auto& k : def.knobs)
+        {
+            const juce::String lab = juce::String (k.label).toUpperCase(), val = knobValueText (proc, editor, k);
+            const float lw = juce::GlyphArrangement::getStringWidth (g.getCurrentFont(), lab), vw = juce::GlyphArrangement::getStringWidth (g.getCurrentFont(), val);
+            const float w = lw + vw + 24.f;
+            if (x + w > (float) in.getRight() - 30.f) break;
+            g.setColour (juce::Colour (0xff0b0d11));
+            g.fillRoundedRectangle (x, y, w, 20.f, 5.f);
+            g.setColour (Theme::dim);
+            g.drawText (lab, juce::Rectangle<float> (x + 8.f, y, lw + 2.f, 20.f), juce::Justification::centredLeft);
+            g.setColour (on ? Theme::text : Theme::dim);
+            g.drawText (val, juce::Rectangle<float> (x + 14.f + lw, y, vw + 4.f, 20.f), juce::Justification::centredLeft);
+            x += w + 6.f;
+            ++shown;
+        }
+        if (shown < (int) def.knobs.size())
+        {
+            g.setColour (Theme::dim);
+            g.drawText ("+" + juce::String ((int) def.knobs.size() - shown), juce::Rectangle<float> (x, y, 30.f, 20.f), juce::Justification::centredLeft);
+        }
+        if (def.vis == Vis::Output)
+        {
+            auto m = juce::Rectangle<float> ((float) in.getX() + 8.f, y + 2.f, (float) in.getWidth() - 16.f, 7.f);
+            for (int ch = 0; ch < 2; ++ch)
+            {
+                const float lv = std::max (-60.f, toDb (proc.outLevel[ch].load()));
+                ledBar (g, m.translated (0.f, ch * 10.f), juce::jlimit (0.f, 1.f, (lv + 60.f) / 60.f), juce::Colours::green, false, true);
+            }
+        }
+    }
+
+private:
+    juce::String live() const
+    {
+        switch (def.vis)
+        {
+            case Vis::DeEss:  return "GR " + juce::String (proc.deessReduction(), 1) + " dB";
+            case Vis::Comp:   return "GR " + juce::String (proc.compReduction(), 1) + " dB";
+            case Vis::Choir:
+            {
+                const auto s = proc.choirSpec();
+                return juce::String (s.singers[0] + s.singers[1] + s.singers[2]) + " singers";
+            }
+            case Vis::Glide:
+            case Vis::Drift:
+            {
+                int t = 0;
+                editor.shapeValue (0, t);
+                return t == 0 ? juce::String ("no notes yet") : juce::String (t) + " notes";
+            }
+            default: return {};
+        }
+    }
+
+    RetuneProcessor& proc;
+    NoteEditor& editor;
+    const int index;
+    const ModuleDef& def;
+    juce::ToggleButton power;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> powerAtt;
+    juce::TextButton openBtn;
+    bool hover = false;
+};
+
+// ===================================================================== overview page
+class dash::Overview : public juce::Component
+{
+public:
+    Overview (RetuneProcessor& p, NoteEditor& e, KnobLook& look) : proc (p)
+    {
+        for (int i = 0; i < (int) modules().size(); ++i)
+        {
+            auto* c = cards.add (new Card (p, e, i, look));
+            c->onOpen = [this] (int k) { if (onOpen) onOpen (k); };
+            addAndMakeVisible (c);
+        }
+    }
+
+    std::function<void (int)> onOpen;
+
+    int layout (int width)                          // lays the cards out, returns the height needed
+    {
+        const int gap = 12, pad = 16, cardH = 128;
+        const int colW = (width - 2 * pad - gap) / 2;
+        int y = pad;
+        chainArea = { pad, y, width - 2 * pad, 58 };
+        y += 58 + 18;
+        head1 = y; y += 24;
+        for (int i = 0; i < 2; ++i) cards[i]->setBounds (pad + i * (colW + gap), y, colW, cardH);
+        y += cardH + 18;
+        head2 = y; y += 24;
+        const int order[] = { 2, 4, 3, 5, 6, 7, 8, 9 };
+        for (int k = 0; k < 8; ++k)
+            cards[order[k]]->setBounds (pad + (k % 2) * (colW + gap), y + (k / 2) * (cardH + gap), colW, cardH);
+        y += 4 * (cardH + gap) + pad;
+        chipRects.clear();
+        return y;
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        // signal flow: clip (with the note tools) -> effects in order -> out. Click a stage to open it.
+        auto a = chainArea.toFloat();
+        g.setColour (juce::Colour (0xff0e1116));
+        g.fillRoundedRectangle (a, 10.f);
+        g.setColour (Theme::border);
+        g.drawRoundedRectangle (a, 10.f, 1.f);
+        g.setColour (Theme::dim);
+        g.setFont (juce::FontOptions (10.f, juce::Font::bold));
+        g.drawText ("SIGNAL FLOW", a.withHeight (16.f).translated (14.f, 4.f), juce::Justification::centredLeft);
+
+        struct Stage { juce::String name; int module; bool on; juce::Colour c; };
+        std::vector<Stage> st;
+        const bool notesOn = moduleOn (proc, modules()[0]) || moduleOn (proc, modules()[1]);
+        st.push_back ({ "CLIP", 0, notesOn, Theme::accent });
+        for (int m : kChain) st.push_back ({ modules()[(size_t) m].name, m, moduleOn (proc, modules()[(size_t) m]), col (modules()[(size_t) m].colour) });
+        st.push_back ({ "OUT", 9, true, Theme::dim });
+
+        auto row = a.reduced (12.f, 0.f).withTrimmedTop (22.f).withTrimmedBottom (8.f);
+        const float arrow = 16.f, w = (row.getWidth() - arrow * (float) (st.size() - 1)) / (float) st.size();
+        chipRects.clear();
+        g.setFont (juce::FontOptions (10.f, juce::Font::bold));
+        for (size_t i = 0; i < st.size(); ++i)
+        {
+            auto r = juce::Rectangle<float> (row.getX() + (float) i * (w + arrow), row.getY(), w, row.getHeight());
+            chipRects.push_back ({ r.toNearestInt(), st[i].module });
+            g.setColour (st[i].on ? st[i].c.withAlpha (0.18f) : juce::Colour (0xff171a20));
+            g.fillRoundedRectangle (r, 6.f);
+            g.setColour (st[i].on ? st[i].c : Theme::border);
+            g.drawRoundedRectangle (r, 6.f, 1.f);
+            g.setColour (st[i].on ? Theme::text : Theme::dim.withAlpha (0.6f));
+            g.drawFittedText (st[i].name, r.toNearestInt().reduced (3, 0), juce::Justification::centred, 1, 0.7f);
+            if (i + 1 < st.size())
+            {
+                const float ax = r.getRight() + 3.f, ay = r.getCentreY();
+                juce::Path p;
+                p.addTriangle (ax + arrow - 6.f, ay, ax + arrow - 11.f, ay - 4.f, ax + arrow - 11.f, ay + 4.f);
+                g.setColour (Theme::dim.withAlpha (0.6f));
+                g.drawLine (ax, ay, ax + arrow - 9.f, ay, 1.2f);
+                g.fillPath (p);
+            }
+        }
+
+        g.setColour (Theme::dim);
+        g.setFont (juce::FontOptions (11.f, juce::Font::bold));
+        g.drawText ("NOTE TOOLS  -  change the notes themselves", 18, head1, 500, 20, juce::Justification::centredLeft);
+        g.drawText ("VOCAL EFFECTS  -  in processing order", 18, head2, 500, 20, juce::Justification::centredLeft);
+    }
+
+    void mouseUp (const juce::MouseEvent& e) override
+    {
+        if (! e.mouseWasClicked()) return;
+        for (auto& c : chipRects)
+            if (c.first.contains (e.getPosition()) && onOpen) { onOpen (c.second); return; }
+    }
+
+    void refresh() { for (auto* c : cards) c->repaint(); repaint (chainArea); }
+
+private:
+    RetuneProcessor& proc;
+    juce::OwnedArray<Card> cards;
+    juce::Rectangle<int> chainArea;
+    int head1 = 0, head2 = 0;
+    std::vector<std::pair<juce::Rectangle<int>, int>> chipRects;
+};
+
+// ===================================================================== settings breakdown (effect page, right side)
+class dash::Breakdown : public juce::Component
+{
+public:
+    Breakdown (Module& m, int i) : mod (m), index (i), def (modules()[(size_t) i]) { setInterceptsMouseClicks (false, false); }
+
+    int preferredHeight (int width) const
+    {
+        juce::ignoreUnused (width);
+        return 100 + (int) def.knobs.size() * 46 + (def.toggleId != nullptr ? 46 : 0);
+    }
+
+    void paint (juce::Graphics& g) override
+    {
+        const juce::Colour c = col (def.colour);
+        auto r = getLocalBounds().toFloat();
+        g.setColour (juce::Colour (0xff12151b));
+        g.fillRoundedRectangle (r, 12.f);
+        g.setColour (Theme::border);
+        g.drawRoundedRectangle (r.reduced (0.5f), 12.f, 1.f);
+
+        auto in = getLocalBounds().reduced (18, 14);
+        g.setColour (Theme::dim);
+        g.setFont (juce::FontOptions (10.5f, juce::Font::bold));
+        g.drawText ("WHAT IT DOES", in.removeFromTop (16), juce::Justification::centredLeft);
+        g.setColour (Theme::text.withAlpha (0.9f));
+        g.setFont (juce::FontOptions (12.5f));
+        g.drawFittedText (moduleDesc (index), in.removeFromTop (46), juce::Justification::topLeft, 3, 1.f);
+        in.removeFromTop (8);
+        if (def.knobs.empty()) return;
+        g.setColour (Theme::dim);
+        g.setFont (juce::FontOptions (10.5f, juce::Font::bold));
+        g.drawText ("SETTINGS", in.removeFromTop (18), juce::Justification::centredLeft);
+
+        auto row = [&] (const juce::String& name, const juce::String& val, const juce::String& help)
+        {
+            auto rr = in.removeFromTop (46);
+            g.setColour (juce::Colours::white.withAlpha (0.05f));
+            g.fillRect (rr.withHeight (1));
+            auto top = rr.withTrimmedTop (6).removeFromTop (16);
+            g.setColour (c);
+            g.setFont (juce::FontOptions (12.f, juce::Font::bold));
+            g.drawText (name, top, juce::Justification::centredLeft);
+            lcd (g, val, top, c);
+            g.setColour (Theme::dim);
+            g.setFont (juce::FontOptions (11.f));
+            g.drawFittedText (help, rr.withTrimmedTop (22).removeFromTop (24), juce::Justification::topLeft, 2, 1.f);
+        };
+        for (int k = 0; k < mod.numKnobs(); ++k)
+            row (def.knobs[(size_t) k].label, mod.knobText (k), knobHelp (index, k));
+        if (def.toggleId != nullptr)
+            row (def.toggleLabel, mod.extraOn() ? "ON" : "OFF", "On: altos sing a third below the melody in the current key. Off: altos sing the melody.");
+    }
+
+private:
+    static void lcd (juce::Graphics& g, const juce::String& t, juce::Rectangle<int> r, juce::Colour c)
+    {
+        g.setFont (juce::FontOptions (juce::Font::getDefaultMonospacedFontName(), 12.f, juce::Font::bold));
+        g.setColour (c.brighter (0.3f));
+        g.drawText (t, r, juce::Justification::centredRight);
+    }
+
+    Module& mod;
+    const int index;
+    const ModuleDef& def;
+};
+
+// ===================================================================== effect page
+class dash::Page : public juce::Component
+{
+public:
+    Page (RetuneProcessor& p, NoteEditor& e, int i, KnobLook& look) : module (p, e, i, look), breakdown (module, i)
+    {
+        module.setMaxCell (112);
+        addAndMakeVisible (module);
+        addAndMakeVisible (breakdown);
+    }
+
+    int layout (int width, int minHeight)
+    {
+        const int pad = 16, gap = 14;
+        const int bw = juce::jlimit (300, 400, width / 3);
+        const int h = juce::jmax (minHeight, breakdown.preferredHeight (bw) + 2 * pad, 470);
+        module.setBounds (pad, pad, width - 2 * pad - gap - bw, h - 2 * pad);
+        breakdown.setBounds (width - pad - bw, pad, bw, h - 2 * pad);
+        return h;
+    }
+
+    void tick() { module.tick(); breakdown.repaint(); }
+
+    Module module;
+    Breakdown breakdown;
+};
+
 // ===================================================================== dashboard
 int FxDashboard::numEffects() { return (int) modules().size() - 1; }
-juce::String FxDashboard::effectName (int i)
-{
-    const juce::String n = modules()[(size_t) i].name;
-    return n.substring (0, 1) + n.substring (1).toLowerCase();
-}
+juce::String FxDashboard::effectName (int i) { return effectTitle (i); }
 juce::String FxDashboard::effectOnParam (int i) { return modules()[(size_t) i].onId; }
 
 FxDashboard::FxDashboard (RetuneProcessor& p, NoteEditor& e) : proc (p), editor (e)
 {
     setLookAndFeel (&look);
-    for (int i = 0; i < numEffects(); ++i)
-    {
-        jump.addItem (effectName (i), i + 1);
-    }
-    jump.setTextWhenNothingSelected ("Jump to effect...");
-    jump.onChange = [this] { if (jump.getSelectedItemIndex() >= 0) focusModule (jump.getSelectedItemIndex()); };
-    addAndMakeVisible (jump);
+    setWantsKeyboardFocus (false);
+
+    for (int i = 0; i < (int) modules().size(); ++i) jump.addItem (effectTitle (i), i + 1);
+    jump.setTextWhenNothingSelected ("Go to effect...");
+    jump.onChange = [this] { if (jump.getSelectedItemIndex() >= 0) showEffect (jump.getSelectedItemIndex()); };
+
+    backBtn.onClick  = [this] { goBack(); };
+    closeBtn.onClick = [this] { if (onClose) onClose(); };
+    prevBtn.onClick  = [this] { showEffect ((page + (int) modules().size() - 1) % (int) modules().size()); };
+    nextBtn.onClick  = [this] { showEffect ((page + 1) % (int) modules().size()); };
+    prevBtn.setConnectedEdges (juce::Button::ConnectedOnRight);
+    nextBtn.setConnectedEdges (juce::Button::ConnectedOnLeft);
+    prevBtn.setTooltip ("Previous effect");
+    nextBtn.setTooltip ("Next effect");
+    closeBtn.setTooltip ("Back to the notes (Esc)");
     allOff.onClick = [this]
     {
-        for (int i = 0; i < numEffects(); ++i)
+        for (int i = 2; i < numEffects(); ++i)
             if (auto* prm = proc.apvts.getParameter (effectOnParam (i)))
-                if (i >= 2) prm->setValueNotifyingHost (0.f);
+                prm->setValueNotifyingHost (0.f);
     };
-    addAndMakeVisible (allOff);
-    for (int i = 0; i < (int) modules().size(); ++i) content.addAndMakeVisible (mods.add (new Module (proc, editor, i, look)));
-    view.setViewedComponent (&content, false);
+    for (auto* c : std::initializer_list<juce::Component*> { &backBtn, &closeBtn, &prevBtn, &nextBtn, &jump, &allOff, &view })
+    {
+        c->setWantsKeyboardFocus (false);
+        addAndMakeVisible (c);
+    }
+
+    overview = std::make_unique<dash::Overview> (proc, editor, look);
+    overview->onOpen = [this] (int i) { showEffect (i); };
     view.setScrollBarsShown (true, false);
     view.setScrollBarThickness (8);
-    addAndMakeVisible (view);
-    setSize (1128, 760);
+    showOverview();
     startTimerHz (30);
 }
 
 FxDashboard::~FxDashboard()
 {
-    mods.clear();
+    view.setViewedComponent (nullptr, false);
+    pageComp.reset();
+    overview.reset();
     setLookAndFeel (nullptr);
 }
 
-void FxDashboard::focusModule (int index)
+void FxDashboard::showOverview()
 {
-    if (index < 0 || index >= mods.size()) return;
-    auto* m = mods[index];
-    view.setViewPosition (0, juce::jmax (0, m->getY() - 10));
-    m->flash();
+    page = -1;
+    view.setViewedComponent (overview.get(), false);
+    pageComp.reset();
+    jump.setSelectedItemIndex (-1, juce::dontSendNotification);
+    backBtn.setButtonText ("<  Back to notes");
+    resized();
+    view.setViewPosition (0, 0);
+    repaint();
+}
+
+void FxDashboard::showEffect (int index)
+{
+    if (index < 0 || index >= (int) modules().size()) return;
+    page = index;
+    auto np = std::make_unique<dash::Page> (proc, editor, index, look);
+    view.setViewedComponent (np.get(), false);
+    pageComp = std::move (np);
     jump.setSelectedItemIndex (index, juce::dontSendNotification);
+    backBtn.setButtonText ("<  All effects");
+    resized();
+    view.setViewPosition (0, 0);
+    repaint();
+}
+
+void FxDashboard::goBack()
+{
+    if (page >= 0) showOverview();
+    else if (onClose) onClose();
 }
 
 void FxDashboard::timerCallback()
 {
-    for (auto* m : mods) if (m->isShowing()) m->tick();
+    if (! isShowing()) return;
+    if (pageComp != nullptr) pageComp->tick();
+    else if (++slowTick % 3 == 0) overview->refresh();
 }
 
 void FxDashboard::paint (juce::Graphics& g)
 {
     g.setGradientFill (juce::ColourGradient (juce::Colour (0xff0f1218), 0.f, 0.f, juce::Colour (0xff0a0c10), 0.f, (float) getHeight(), false));
     g.fillAll();
-    auto top = getLocalBounds().removeFromTop (56);
+    auto top = getLocalBounds().removeFromTop (kHeadH);
     g.setColour (juce::Colour (0xff12151b));
     g.fillRect (top);
     g.setColour (Theme::border);
     g.fillRect (top.removeFromBottom (1));
-    g.setColour (Theme::text);
-    g.setFont (juce::FontOptions (19.f, juce::Font::bold));
-    g.drawText ("EFFECTS", 22, 0, 160, 56, juce::Justification::centredLeft);
-    g.setColour (Theme::dim);
-    g.setFont (juce::FontOptions (11.5f));
-    g.drawText ("Every module has its own power switch. Double-click a knob to reset it.", 120, 0, 460, 56, juce::Justification::centredLeft);
+
+    const int tx = backBtn.getRight() + 18;
+    const int tw = (page >= 0 ? prevBtn.getX() : jump.getX()) - tx - 10;
+    if (page < 0)
+    {
+        g.setColour (Theme::text);
+        g.setFont (juce::FontOptions (17.f, juce::Font::bold));
+        g.drawText ("Effects", tx, 0, 100, kHeadH, juce::Justification::centredLeft);
+        g.setColour (Theme::dim);
+        g.setFont (juce::FontOptions (11.5f));
+        g.drawText ("Click any effect to open it. Power buttons switch effects on and off.", tx + 86, 0, juce::jmax (0, tw - 86), kHeadH, juce::Justification::centredLeft);
+    }
+    else
+    {
+        const auto& d = dash::modules()[(size_t) page];
+        g.setColour (juce::Colour (d.colour));
+        g.fillRoundedRectangle ((float) tx, (float) kHeadH * 0.5f - 9.f, 3.f, 18.f, 1.5f);
+        g.setColour (Theme::dim);
+        g.setFont (juce::FontOptions (12.f));
+        g.drawText ("Effects  /", tx + 12, 0, 70, kHeadH, juce::Justification::centredLeft);
+        g.setColour (Theme::text);
+        g.setFont (juce::FontOptions (17.f, juce::Font::bold));
+        g.drawText (d.name, tx + 80, 0, juce::jmax (0, tw - 80), kHeadH, juce::Justification::centredLeft);
+    }
 }
 
 void FxDashboard::resized()
 {
     auto b = getLocalBounds();
-    auto top = b.removeFromTop (56).reduced (16, 13);
-    allOff.setBounds (top.removeFromRight (130));
+    auto top = b.removeFromTop (kHeadH).reduced (14, 11);
+    backBtn.setBounds (top.removeFromLeft (page >= 0 ? 118 : 140));
+    const bool onPage = page >= 0;
+    closeBtn.setVisible (true);
+    closeBtn.setBounds (top.removeFromRight (84));
     top.removeFromRight (10);
-    jump.setBounds (top.removeFromRight (190));
+    allOff.setVisible (! onPage);
+    if (! onPage) { allOff.setBounds (top.removeFromRight (130)); top.removeFromRight (10); }
+    jump.setBounds (top.removeFromRight (180));
+    top.removeFromRight (10);
+    prevBtn.setVisible (onPage);
+    nextBtn.setVisible (onPage);
+    if (onPage)
+    {
+        nextBtn.setBounds (top.removeFromRight (34));
+        prevBtn.setBounds (top.removeFromRight (34));
+    }
     view.setBounds (b);
 
-    // 4-column grid; compressor and choir are double width
-    const int gap = 12, cols = 4;
-    const int w = view.getWidth() - view.getScrollBarThickness() - gap;
-    const int cw = (w - gap * cols) / cols;
-    const int rowH[3] = { 262, 318, 262 };
-    const int layout[][3] = { { 0, 0, 0 }, { 1, 0, 1 }, { 2, 0, 2 }, { 3, 0, 3 },     // index, row, column
-                              { 4, 1, 0 }, { 5, 1, 2 },
-                              { 6, 2, 0 }, { 7, 2, 1 }, { 8, 2, 2 }, { 9, 2, 3 } };
-    int y[3];
-    y[0] = gap;
-    y[1] = y[0] + rowH[0] + gap;
-    y[2] = y[1] + rowH[1] + gap;
-    for (const auto& l : layout)
-    {
-        const int span = modules()[(size_t) l[0]].span;
-        mods[l[0]]->setBounds (gap + l[2] * (cw + gap), y[l[1]], cw * span + gap * (span - 1), rowH[l[1]]);
-    }
-    content.setSize (w + gap, y[2] + rowH[2] + gap);
+    const int w = view.getWidth() - view.getScrollBarThickness();
+    if (page < 0 && overview != nullptr) overview->setSize (w, overview->layout (w));
+    if (pageComp != nullptr) pageComp->setSize (w, pageComp->layout (w, view.getHeight()));
+}
+
+bool FxDashboard::keyPressed (const juce::KeyPress& k)
+{
+    if (k == juce::KeyPress::escapeKey) { goBack(); return true; }
+    return false;
 }

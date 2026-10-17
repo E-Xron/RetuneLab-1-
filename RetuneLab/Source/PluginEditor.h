@@ -132,12 +132,13 @@ public:
     ~RetuneEditor() override;
     void paint (juce::Graphics&) override;
     void resized() override;
-    bool keyPressed (const juce::KeyPress& k) override { return noteEditor.keyPressed (k); }
+    bool keyPressed (const juce::KeyPress& k) override;
 
 private:
     void timerCallback() override;
     void updateScale();
-    void showEffects (int page);
+    void openEffects (int page);                  // -1: overview
+    void closeEffects();
     void showEffectsMenu();
     void showHotkeys();
     void toggleRecord();
@@ -151,9 +152,9 @@ private:
                      fxBtn { "Effects" }, keysBtn { "Hotkeys" };
     juce::ComboBox keyBox, scaleBox;
     juce::Label statusLabel;
-    std::unique_ptr<ToolWindow> fxWin, keyWin;
+    std::unique_ptr<ToolWindow> keyWin;
+    std::unique_ptr<FxDashboard> fxView;
     static constexpr int kBarH = 58;
     juce::Rectangle<int> logoArea;
     std::vector<int> dividers;
-    FxDashboard* fxPanel = nullptr;
 };

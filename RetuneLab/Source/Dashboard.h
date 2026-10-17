@@ -46,16 +46,27 @@ namespace dash
     };
 
     class Module;
+    class Card;
+    class Overview;
+    class Breakdown;
+    class Page;
 }
 
+// The Effects view: lives inside the plugin window. An overview of every effect and its settings, and a page for
+// each effect with big knobs, its display and a breakdown of what every control does.
 class FxDashboard : public juce::Component, private juce::Timer
 {
 public:
     FxDashboard (RetuneProcessor&, NoteEditor&);
     ~FxDashboard() override;
-    void focusModule (int index);                 // index into dash::modules()
+    void showOverview();
+    void showEffect (int index);                  // index into dash::modules()
+    void goBack();                                // effect page -> overview -> close
+    bool isOverview() const { return page < 0; }
+    std::function<void()> onClose;
     void paint (juce::Graphics&) override;
     void resized() override;
+    bool keyPressed (const juce::KeyPress&) override;
 
     static int numEffects();                      // modules that are effects (for menus)
     static juce::String effectName (int i);
@@ -63,14 +74,15 @@ public:
 
 private:
     void timerCallback() override;
+    static constexpr int kHeadH = 54;
 
     RetuneProcessor& proc;
     NoteEditor& editor;
     dash::KnobLook look;
+    juce::TextButton backBtn { "<  Back" }, closeBtn { "Close" }, prevBtn { "<" }, nextBtn { ">" }, allOff { "All effects off" };
     juce::ComboBox jump;
-    juce::TextButton allOff { "All effects off" };
     juce::Viewport view;
-    juce::Component content;
-    juce::OwnedArray<dash::Module> mods;
-    int highlight = -1, highlightTicks = 0;
+    std::unique_ptr<dash::Overview> overview;
+    std::unique_ptr<dash::Page> pageComp;
+    int page = -1, slowTick = 0;
 };

@@ -844,6 +844,10 @@ RetuneEditor::RetuneEditor (RetuneProcessor& p)
         if (a == Act::Clear)     proc.clearClip();
     };
 
+    fxView = std::make_unique<FxDashboard> (proc, noteEditor);
+    fxView->onClose = [this] { closeEffects(); };
+    addChildComponent (*fxView);
+
     setResizable (true, true);
     setResizeLimits (1240, 480, 2200, 1300);
     setSize (1240, 700);
@@ -852,7 +856,7 @@ RetuneEditor::RetuneEditor (RetuneProcessor& p)
 
 RetuneEditor::~RetuneEditor()
 {
-    fxWin.reset();
+    fxView.reset();
     keyWin.reset();
     setLookAndFeel (nullptr);
 }
@@ -872,17 +876,19 @@ void RetuneEditor::selectTool (bool split)
 void RetuneEditor::showEffectsMenu()
 {
     juce::PopupMenu m;
-    m.addSectionHeader ("Notes");
+    m.addItem (98, "Effects overview");
+    m.addSectionHeader ("Note tools");
     for (int i = 0; i < FxDashboard::numEffects(); ++i)
     {
         if (i == 2) m.addSectionHeader ("Vocal effects");
         auto* prm = proc.apvts.getParameter (FxDashboard::effectOnParam (i));
         const bool on = prm != nullptr && prm->getValue() > 0.5f;
-        m.addItem (juce::PopupMenu::Item (FxDashboard::effectName (i)).setID (i + 1).setTicked (on));
+        m.addItem (juce::PopupMenu::Item (FxDashboard::effectName (i) + (on ? "   (on)" : "")).setID (i + 1).setTicked (on));
     }
+    m.addItem (FxDashboard::numEffects() + 1, "Output meters");
     m.addSeparator();
-    m.addItem (99, "Open dashboard");
     m.addItem (100, "Turn all vocal effects off");
+    if (fxView->isVisible()) m.addItem (101, "Close effects");
 
     juce::Component::SafePointer<RetuneEditor> safe (this);
     m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&fxBtn), [safe] (int r)
@@ -895,27 +901,37 @@ void RetuneEditor::showEffectsMenu()
                     prm->setValueNotifyingHost (0.f);
             return;
         }
-        safe->showEffects (r == 99 ? -1 : r - 1);
+        if (r == 101) { safe->closeEffects(); return; }
+        safe->openEffects (r == 98 ? -1 : r - 1);
     });
 }
 
-void RetuneEditor::showEffects (int pg)
+void RetuneEditor::openEffects (int pg)
 {
-    if (fxWin == nullptr)
+    if (pg >= 0) fxView->showEffect (pg);
+    else fxView->showOverview();
+    fxView->setVisible (true);
+    fxView->toFront (false);
+    noteEditor.setVisible (false);
+    fxBtn.setToggleState (true, juce::dontSendNotification);
+}
+
+void RetuneEditor::closeEffects()
+{
+    fxView->setVisible (false);
+    noteEditor.setVisible (true);
+    fxBtn.setToggleState (false, juce::dontSendNotification);
+    grabKeyboardFocus();
+}
+
+bool RetuneEditor::keyPressed (const juce::KeyPress& k)
+{
+    if (fxView != nullptr && fxView->isVisible())
     {
-        fxWin = std::make_unique<ToolWindow> ("RetuneLab Effects");
-        fxWin->setLookAndFeel (&laf);
-        fxPanel = new FxDashboard (proc, noteEditor);
-        fxWin->setContentOwned (fxPanel, true);
-        fxWin->setUsingNativeTitleBar (true);
-        fxWin->setResizable (true, false);
-        fxWin->setResizeLimits (1128, 420, 1128, 1400);
-        fxWin->setAlwaysOnTop (true);
-        fxWin->centreAroundComponent (this, fxWin->getWidth(), fxWin->getHeight());
+        if (k == juce::KeyPress::escapeKey) { fxView->goBack(); return true; }
+        return false;
     }
-    fxWin->setVisible (true);
-    fxWin->toFront (true);
-    if (pg >= 0) fxPanel->focusModule (pg);
+    return noteEditor.keyPressed (k);
 }
 
 void RetuneEditor::showHotkeys()
@@ -1037,4 +1053,5 @@ void RetuneEditor::resized()
     clearBtn.setBounds (bar.removeFromLeft (58));
     statusLabel.setBounds (bar);
     noteEditor.setBounds (b);
+    if (fxView != nullptr) fxView->setBounds (b);
 }

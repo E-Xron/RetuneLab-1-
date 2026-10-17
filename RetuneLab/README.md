@@ -19,9 +19,13 @@ Editing
 - Hotkeys button: assign your own shortcuts (including Clear).
 - Wheel: scroll pitch. Shift+wheel: scroll time. Ctrl/Cmd+wheel: zoom time.
 
-Effects menu (every entry has its own On switch; ticked = on). "Open dashboard" shows every effect as a
-hardware-style module with machined knobs, a power LED, meters (compressor VU, de-esser and level LEDs, choir
-section meters) and a live display. The dropdown at the top jumps to an effect; "All effects off" bypasses them all.
+Effects (opens inside the plugin window, no pop-up)
+- Effects button: "Effects overview", or pick one effect to go straight to its page. Ticked = on.
+- Overview: the signal flow and a card per effect showing what it does and its current settings. Click a card
+  (or a stage in the signal flow) to open it. Power buttons switch effects on and off.
+- Effect page: big knobs, the effect's display/meters and a breakdown of what every control does.
+  "< All effects" goes back to the overview, the arrows step through effects, Close (or Esc) returns to the notes.
+- Moving a knob on a bypassed effect switches it on.
 - Note Glide: portamento into a note from the one before it. Glide Time (0-500 ms) and Smoothness
   (straight line to S-curve). Applies to the selected notes, or all notes if none are selected.
 - Drift & Vibrato: scale the slow pitch drift and the vibrato as sung (0% flat, 100% as sung, 200% exaggerated).
