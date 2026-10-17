@@ -196,8 +196,102 @@ void ClipEngine::detectKey (const std::vector<Note>& notes, int& root, bool& min
         }
 }
 
+std::vector<float> ClipEngine::slowContour (const ClipAnalysis& an, const std::vector<Note>& notes, double sr)
+{
+    const int nf = (int) an.contour.size();
+    std::vector<float> slow ((size_t) nf, kNaN);
+    if (nf == 0) return slow;
+    const int R = std::max (1, (int) std::lround (0.09 * sr / an.hop));     // ~180 ms window: about one vibrato cycle
+    for (const auto& n : notes)
+    {
+        const int fa = std::max (0, (int) std::ceil ((double) (n.srcStart - an.frameOffset) / an.hop));
+        const int fb = std::min (nf - 1, (int) std::floor ((double) (n.srcEnd - an.frameOffset) / an.hop));
+        for (int f = fa; f <= fb; ++f)
+        {
+            double s = 0.0; int cnt = 0;
+            for (int j = std::max (fa, f - R); j <= std::min (fb, f + R); ++j)
+                if (! std::isnan (an.contour[(size_t) j])) { s += an.contour[(size_t) j]; ++cnt; }
+            if (cnt > 0) slow[(size_t) f] = (float) (s / cnt);
+        }
+    }
+    return slow;
+}
+
+double ClipEngine::contourAt (const ClipAnalysis& an, const std::vector<float>& c, double s, float fallback)
+{
+    const int nf = (int) c.size();
+    auto valid = [&] (int j) { return j >= 0 && j < nf && ! std::isnan (c[(size_t) j]); };
+    const double fi = (s - an.frameOffset) / an.hop;
+    const int i0 = (int) std::floor (fi);
+    const double fr = fi - i0;
+    if (valid (i0) && valid (i0 + 1))
+        return c[(size_t) i0] + (c[(size_t) i0 + 1] - c[(size_t) i0]) * fr;
+    const int ic = (int) std::lround (fi);
+    for (int k = 0; k <= 8; ++k)
+        for (int sg = -1; sg <= 1; sg += 2)
+            if (valid (ic + sg * k)) return c[(size_t) (ic + sg * k)];
+    return (double) fallback;
+}
+
+int ClipEngine::glideFrom (const std::vector<Note>& notes, int i, double sr)
+{
+    const Note& n = notes[(size_t) i];
+    const int maxGap = (int) (0.15 * sr);
+    int best = -1;
+    for (int j = 0; j < (int) notes.size(); ++j)
+    {
+        const Note& p = notes[(size_t) j];
+        if (j == i || p.muted || p.outStart >= n.outStart) continue;
+        if (p.outEnd() < n.outStart - maxGap || p.outEnd() > n.outStart + n.outLen / 2) continue;
+        if (best < 0 || p.outEnd() > notes[(size_t) best].outEnd()) best = j;
+    }
+    return best;
+}
+
+namespace
+{
+    double glideOffset (const std::vector<Note>& notes, int i, int prev, double outPos, double sr)
+    {
+        if (prev < 0) return 0.0;
+        const Note& n = notes[(size_t) i];
+        const double from = notes[(size_t) prev].targetMid - n.targetMid;
+        const double gl = std::min ((double) n.glideMs * 0.001 * sr, 0.8 * n.outLen);
+        if (gl < 1.0 || std::abs (from) < 0.02) return 0.0;
+        const double u = (outPos - n.outStart) / gl;
+        if (u >= 1.0) return 0.0;
+        if (u <= 0.0) return from;
+        const double sm = (double) std::max (0.f, std::min (1.f, n.glideSmooth));
+        const double shape = (1.0 - sm) * u + sm * u * u * (3.0 - 2.0 * u);
+        return from * (1.0 - shape);
+    }
+}
+
+double ClipEngine::shiftAt (const std::vector<Note>& notes, int i, int prev, const ClipAnalysis& an,
+                            const std::vector<float>& slow, double outPos, double sr, const RenderOptions& o)
+{
+    const Note& n = notes[(size_t) i];
+    double semis = n.targetMid - n.detectedMid;
+    if (o.shape && (std::abs (n.drift - 1.f) > 1e-3f || std::abs (n.vibrato - 1.f) > 1e-3f) && n.outLen > 0)
+    {
+        const double ts = n.srcStart + (outPos - n.outStart) * (double) n.srcLen() / (double) n.outLen;
+        const double p  = contourAt (an, an.contour, ts, n.detectedMid);
+        const double sl = contourAt (an, slow, ts, (float) p);
+        semis += (n.drift - 1.0) * (sl - n.detectedMid) + (n.vibrato - 1.0) * (p - sl);
+    }
+    if (o.glide) semis += glideOffset (notes, i, prev, outPos, sr);
+    return std::max (-24.0, std::min (24.0, semis));
+}
+
+bool ClipEngine::isEdited (const std::vector<Note>& notes, int i, int prev, const RenderOptions& o)
+{
+    const Note& n = notes[(size_t) i];
+    if (std::abs (n.targetMid - n.detectedMid) > 1e-3f || n.outStart != n.srcStart || n.outLen != n.srcLen()) return true;
+    if (o.shape && (std::abs (n.drift - 1.f) > 1e-3f || std::abs (n.vibrato - 1.f) > 1e-3f)) return true;
+    return o.glide && prev >= 0 && n.glideMs > 0.5f && std::abs (notes[(size_t) prev].targetMid - n.targetMid) > 0.02f;
+}
+
 void ClipEngine::render (const float* const* src, int nch, int len, double sr,
-                         const std::vector<Note>& notes, const ClipAnalysis& an,
+                         const std::vector<Note>& notes, const ClipAnalysis& an, const RenderOptions& opts,
                          std::vector<std::vector<float>>& out)
 {
     out.assign ((size_t) nch, std::vector<float> ((size_t) len, 0.f));
@@ -208,25 +302,10 @@ void ClipEngine::render (const float* const* src, int nch, int len, double sr,
     const double pi = 3.14159265358979323846;
     const int Tmin = std::max (8, (int) (sr / 1000.0)), Tmax = (int) (sr / 70.0);
     const int h = std::max (8, (int) (0.006 * sr));            // half-length of the note-to-note crossfade (6 ms)
-    const int nf = (int) an.contour.size();
 
-    auto validAt = [&] (int j) { return j >= 0 && j < nf && ! std::isnan (an.contour[(size_t) j]); };
-    auto midiAt = [&] (double s, float fallback) -> double       // pitch at any sample, interpolated between frames
-    {
-        const double fi = (s - an.frameOffset) / an.hop;
-        const int i0 = (int) std::floor (fi);
-        const double fr = fi - i0;
-        if (validAt (i0) && validAt (i0 + 1))
-            return an.contour[(size_t) i0] + (an.contour[(size_t) i0 + 1] - an.contour[(size_t) i0]) * fr;
-        const int ic = (int) std::lround (fi);
-        for (int k = 0; k <= 8; ++k)
-            for (int sg = -1; sg <= 1; sg += 2)
-                if (validAt (ic + sg * k)) return an.contour[(size_t) (ic + sg * k)];
-        return (double) fallback;
-    };
     auto periodAt = [&] (double s, float fb) -> double
     {
-        return std::min ((double) Tmax, std::max ((double) Tmin, sr / midiToHz (midiAt (s, fb))));
+        return std::min ((double) Tmax, std::max ((double) Tmin, sr / midiToHz (contourAt (an, an.contour, s, fb))));
     };
     auto argmax = [&] (int lo, int hi) -> int
     {
@@ -249,8 +328,11 @@ void ClipEngine::render (const float* const* src, int nch, int len, double sr,
         for (int i = s0; i <= s1; ++i) cover[(size_t) i] += (float) wcross ((double) i, a, b);
     };
 
-    auto renderNote = [&] (const Note& nt, std::vector<double>& prevEpochs, int& prevEnd) -> bool
+    const std::vector<float> slow = slowContour (an, notes, sr);
+
+    auto renderNote = [&] (int ni, int prevNi, std::vector<double>& prevEpochs, int& prevEnd) -> bool
     {
+        const Note& nt = notes[(size_t) ni];
         const int a = std::max (0, nt.srcStart), b = std::min (len, nt.srcEnd);
         if (b - a < 128 || nt.outLen < 2 * h + 16) return false;
         const int lo = std::max (0, a - 2 * h), hi = std::min (len - 1, b + 2 * h);
@@ -300,9 +382,8 @@ void ClipEngine::render (const float* const* src, int nch, int len, double sr,
             Tloc[k] = std::min ((double) Tmax, std::max ((double) Tmin, t));
         }
 
-        const double semis   = std::max (-24.0, std::min (24.0, (double) (nt.targetMid - nt.detectedMid)));
-        const double ratio   = std::pow (2.0, semis / 12.0);
         const double stretch = (double) (b - a) / (double) nt.outLen;
+        auto ratioAt = [&] (double e) { return std::pow (2.0, shiftAt (notes, ni, prevNi, an, slow, e, sr, opts) / 12.0); };
 
         auto nearestMark = [&] (double tsrc) -> size_t
         {
@@ -312,7 +393,7 @@ void ClipEngine::render (const float* const* src, int nch, int len, double sr,
             if (std::abs ((double) marks[k - 1] - tsrc) <= std::abs ((double) marks[k] - tsrc)) --k;
             return k;
         };
-        auto TsAt = [&] (double e) { return Tloc[nearestMark ((double) a + (e - nt.outStart) * stretch)] / ratio; };
+        auto TsAt = [&] (double e) { return Tloc[nearestMark ((double) a + (e - nt.outStart) * stretch)] / ratioAt (e); };
 
         // Phase anchor: start this note's pulse train on the same beat as its neighbour so adjacent notes
         // crossfade in phase instead of cancelling (that cancellation is the "pop").
@@ -324,7 +405,7 @@ void ClipEngine::render (const float* const* src, int nch, int len, double sr,
         }
         else
         {
-            const double T = periodAt ((double) a, nt.detectedMid) / ratio;
+            const double T = periodAt ((double) a, nt.detectedMid) / ratioAt ((double) nt.outStart);
             e0 = (double) argmax ((int) (nt.outStart - T / 2), (int) (nt.outStart + T / 2));
         }
         for (int guard = 0; guard < 100000 && e0 - TsAt (e0) >= (double) (nt.outStart - h); ++guard) e0 -= TsAt (e0);
@@ -351,7 +432,7 @@ void ClipEngine::render (const float* const* src, int nch, int len, double sr,
                 ws[(size_t) oi] += w;
             }
             epochs.push_back (e);
-            e += Tloc[k] / ratio;
+            e += Tloc[k] / ratioAt (e);
         }
         for (int i = 0; i < size; ++i)                              // normalise the overlap-add, then apply the crossfade
         {
@@ -364,19 +445,19 @@ void ClipEngine::render (const float* const* src, int nch, int len, double sr,
         return true;
     };
 
-    std::vector<const Note*> order;
-    for (const auto& n : notes) order.push_back (&n);
-    std::stable_sort (order.begin(), order.end(), [] (const Note* x, const Note* y) { return x->outStart < y->outStart; });
+    std::vector<int> order;
+    for (int i = 0; i < (int) notes.size(); ++i) order.push_back (i);
+    std::stable_sort (order.begin(), order.end(), [&] (int x, int y) { return notes[(size_t) x].outStart < notes[(size_t) y].outStart; });
 
     std::vector<double> prevEpochs;
     int prevEnd = -1000000000;
-    for (const Note* np : order)
+    for (int ni : order)
     {
-        const Note& nt = *np;
+        const Note& nt = notes[(size_t) ni];
         if (nt.muted) { addCover (nt); continue; }
-        const bool edited = std::abs (nt.targetMid - nt.detectedMid) > 1e-3f || nt.outStart != nt.srcStart || nt.outLen != nt.srcLen();
-        if (! edited) { prevEpochs.clear(); continue; }          // untouched notes play the original audio, bit for bit
-        if (renderNote (nt, prevEpochs, prevEnd)) addCover (nt);
+        const int prevNi = glideFrom (notes, ni, sr);
+        if (! isEdited (notes, ni, prevNi, opts)) { prevEpochs.clear(); continue; }   // untouched notes play the original audio, bit for bit
+        if (renderNote (ni, prevNi, prevEpochs, prevEnd)) addCover (nt);
     }
     for (int c = 0; c < nch; ++c)
         for (int i = 0; i < len; ++i)

@@ -47,6 +47,13 @@ public:
     void splitAtPlayhead();
     void fitView();
 
+    // Per-note glide / drift / vibrato, used by the Effects window. They act on the selected notes,
+    // or on every note when nothing is selected. field: 0 glide ms, 1 glide smoothness, 2 drift, 3 vibrato.
+    void  beginShapeEdit();
+    void  setShape (int field, float value);
+    void  endShapeEdit();
+    float shapeValue (int field, int& targets) const;
+
     std::function<void (Act)> onExtraAction;       // record / tool switching, handled by the editor
 
 private:
@@ -101,18 +108,39 @@ public:
     void closeButtonPressed() override { setVisible (false); }
 };
 
-class AirPanel : public juce::Component
+// The Effects window: a dropdown of every effect, an on/off switch, and that effect's controls.
+class FxPanel : public juce::Component, private juce::Timer
 {
 public:
-    explicit AirPanel (RetuneProcessor&);
+    FxPanel (RetuneProcessor&, NoteEditor&);
+    ~FxPanel() override;
+    void showPage (int page);
     void paint (juce::Graphics&) override;
     void resized() override;
+
+    static int numPages();
+    static juce::String pageName (int page);
+    static juce::String pageOnParam (int page);
+
 private:
-    juce::Slider mid, high;
-    juce::Label midL, highL;
-    juce::ToggleButton on { "Enabled" };
-    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> aMid, aHigh;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> aOn;
+    void timerCallback() override;
+    void buildPage();
+
+    RetuneProcessor& proc;
+    NoteEditor& editor;
+    int page = 0;
+    juce::ComboBox pageBox;
+    juce::ToggleButton onBtn { "On" };
+    juce::Label info;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> onAtt;
+    juce::OwnedArray<juce::Slider> knobs;
+    juce::OwnedArray<juce::Label> knobLabels;
+    juce::OwnedArray<juce::AudioProcessorValueTreeState::SliderAttachment> knobAtts;
+    std::unique_ptr<juce::ComboBox> choice;
+    std::unique_ptr<juce::Label> choiceLabel;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> choiceAtt;
+    std::vector<int> shapeField;                  // per knob: note field it edits, or -1 for a parameter
+    bool shapeDragging = false;
 };
 
 class HotkeyPanel : public juce::Component
@@ -143,7 +171,8 @@ public:
 private:
     void timerCallback() override;
     void updateScale();
-    void showAir();
+    void showEffects (int page);
+    void showEffectsMenu();
     void showHotkeys();
     void toggleRecord();
     void selectTool (bool split);
@@ -153,8 +182,9 @@ private:
     NoteEditor noteEditor;
     juce::TextButton recBtn { "Record" }, editBtn { "Edit" }, splitBtn { "Split" },
                      undoBtn { "Undo" }, snapBtn { "Snap all: Scale" }, snapSemiBtn { "Snap all: Semitone" }, clearBtn { "Clear" },
-                     airBtn { "Air" }, keysBtn { "Hotkeys" };
+                     fxBtn { "Effects" }, keysBtn { "Hotkeys" };
     juce::ComboBox keyBox, scaleBox;
     juce::Label statusLabel;
-    std::unique_ptr<ToolWindow> airWin, keyWin;
+    std::unique_ptr<ToolWindow> fxWin, keyWin;
+    FxPanel* fxPanel = nullptr;
 };

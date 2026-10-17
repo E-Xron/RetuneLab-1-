@@ -16,8 +16,25 @@ Editing
 - Keyboard strip on the left: click or drag to switch pitch classes on/off (these are the notes "Snap to scale"
   uses). Changing the Key or Scale dropdown resets the active notes to exactly that scale.
 - Clear wipes the clip; Undo (button or hotkey) brings it back.
-- Hotkeys button: assign your own shortcuts (including Clear). Air button: Mid Air / High Air.
+- Hotkeys button: assign your own shortcuts (including Clear).
 - Wheel: scroll pitch. Shift+wheel: scroll time. Ctrl/Cmd+wheel: zoom time.
+
+Effects menu (every entry has its own On switch; ticked = on)
+- Note Glide: portamento into a note from the one before it. Glide Time (0-500 ms) and Smoothness
+  (straight line to S-curve). Applies to the selected notes, or all notes if none are selected.
+- Drift & Vibrato: scale the slow pitch drift and the vibrato as sung (0% flat, 100% as sung, 200% exaggerated).
+  Per note, same selection rule. The pitch curve inside each note shows the result.
+- De-Esser: split-band sibilance reduction (Threshold, Frequency, Max Reduction).
+- Compressor: soft-knee RMS compressor with program-dependent release and auto make-up
+  (Threshold, Ratio, Attack, Release, Mix).
+- Air: Mid Air / High Air exciter.
+- Choir: turns the vocal into a choir. Bass an octave down, alto at pitch, soprano an octave up, each singer with
+  its own timing, detune and stereo position. Size (3-24 singers), Bass/Alto/Soprano Share (how the singers are
+  split between sections), Bass/Alto/Soprano Volume, Mix.
+- Doubler: double-tracked vocal (Width, Detune, Mix).
+- Echo: tempo-synced delay, 1/16 to 1/2 note (Time, Feedback, Tone, Mix).
+- Reverb: Size, Damping, Width, Mix.
+All effect controls are host-automatable.
 
 Build: see the GitHub Actions workflow, or
     cmake -B build -DCMAKE_BUILD_TYPE=Release

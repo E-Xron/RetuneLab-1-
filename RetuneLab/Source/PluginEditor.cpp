@@ -13,6 +13,12 @@ namespace
     }
 
     // The pitch a snap should start from: what was actually sung, unless the user moved it far on purpose.
+    inline void resetNote (Note& n)
+    {
+        n.outStart = n.srcStart; n.outLen = n.srcLen(); n.targetMid = n.detectedMid; n.muted = false;
+        n.glideMs = 0.f; n.glideSmooth = 0.5f; n.drift = 1.f; n.vibrato = 1.f;
+    }
+
     inline float snapBase (const Note& n)
     {
         return std::abs (n.targetMid - n.detectedMid) > 0.5f ? n.targetMid : n.detectedMid;
@@ -152,12 +158,16 @@ void NoteEditor::paint (juce::Graphics& g)
 
     // ---- notes
     const auto v = proc.getNotes();
-    for (const auto& n : v)
+    const auto slow = ClipEngine::slowContour (analysisCache, v, sr());
+    const RenderOptions ro = proc.renderOptions();
+    for (int ni = 0; ni < (int) v.size(); ++ni)
     {
+        const auto& n = v[(size_t) ni];
         const auto r = noteRect (n);
         if (r.getRight() < kKeyW || r.getX() > (float) getWidth()) continue;
 
-        const bool edited = n.outStart != n.srcStart || n.outLen != n.srcLen() || std::abs (n.targetMid - n.detectedMid) > 0.01f;
+        const int prev = ClipEngine::glideFrom (v, ni, sr());
+        const bool edited = ClipEngine::isEdited (v, ni, prev, ro);
         if (edited && ! n.muted)
         {
             const float gx0 = xFromSample (n.srcStart), gx1 = xFromSample (n.srcEnd), gy = yFromMidi (n.detectedMid);
@@ -195,7 +205,7 @@ void NoteEditor::paint (juce::Graphics& g)
             g.fillRoundedRectangle (r.getRight() - 4.5f, r.getY() + 3.f, 2.f, r.getHeight() - 6.f, 1.f);
         }
 
-        if (! analysisCache.contour.empty() && n.srcLen() > 0)      // detected pitch curve inside the blob
+        if (! analysisCache.contour.empty() && n.srcLen() > 0 && n.outLen > 0)   // pitch curve as it will play
         {
             juce::Graphics::ScopedSaveState ss (g);
             g.reduceClipRegion (r.expanded (0.f, 2.f).toNearestInt());
@@ -210,7 +220,8 @@ void NoteEditor::paint (juce::Graphics& g)
                 if (std::isnan (c)) { pen = false; continue; }
                 const double s = (double) f * analysisCache.hop + analysisCache.frameOffset;
                 const double outS = n.outStart + (s - n.srcStart) * (double) n.outLen / (double) n.srcLen();
-                const float x = xFromSample (outS), y = yFromMidi (c + n.targetMid - n.detectedMid);
+                const double sh = ClipEngine::shiftAt (v, ni, prev, analysisCache, slow, outS, sr(), ro);
+                const float x = xFromSample (outS), y = yFromMidi ((float) (c + sh));
                 if (! pen) { path.startNewSubPath (x, y); pen = true; } else path.lineTo (x, y);
             }
             g.setColour (juce::Colours::white.withAlpha (0.78f));
@@ -552,7 +563,7 @@ void NoteEditor::runMenuAction (int r, int idx, int splitSample)
         case 2: if (! mergeNext (v, idx))            { undoStack.pop_back(); return; } break;
         case 3: for (auto& n : v) if (n.selected) n.targetMid = std::round (snapBase (n)); break;
         case 4: for (auto& n : v) if (n.selected) n.targetMid = nearestInScale (snapBase (n)); break;
-        case 5: for (auto& n : v) if (n.selected) { n.outStart = n.srcStart; n.outLen = n.srcLen(); n.targetMid = n.detectedMid; n.muted = false; } break;
+        case 5: for (auto& n : v) if (n.selected) resetNote (n); break;
         case 6: { const bool m = ! v[(size_t) idx].muted; for (auto& n : v) if (n.selected) n.muted = m; break; }
         default: break;
     }
@@ -625,7 +636,7 @@ void NoteEditor::resetSelected()
     bool any = false;
     for (auto& n : v) any = any || n.selected;
     for (auto& n : v)
-        if (! any || n.selected) { n.outStart = n.srcStart; n.outLen = n.srcLen(); n.targetMid = n.detectedMid; n.muted = false; }
+        if (! any || n.selected) resetNote (n);
     commit (v);
 }
 
@@ -647,6 +658,48 @@ void NoteEditor::splitAtPlayhead()
     }
 }
 
+void NoteEditor::beginShapeEdit()
+{
+    pushUndo (proc.getNotes());
+}
+
+void NoteEditor::setShape (int field, float value)
+{
+    auto v = proc.getNotes();
+    bool any = false;
+    for (auto& n : v) any = any || n.selected;
+    for (auto& n : v)
+    {
+        if (any && ! n.selected) continue;
+        if (field == 0) n.glideMs = value;
+        else if (field == 1) n.glideSmooth = value;
+        else if (field == 2) n.drift = value;
+        else n.vibrato = value;
+    }
+    proc.setNotes (std::move (v));
+    repaint();
+}
+
+void NoteEditor::endShapeEdit()
+{
+    proc.requestRender();
+}
+
+float NoteEditor::shapeValue (int field, int& targets) const
+{
+    const auto v = proc.getNotes();
+    bool any = false;
+    for (auto& n : v) any = any || n.selected;
+    targets = 0;
+    float val = field == 0 ? 0.f : (field == 1 ? 0.5f : 1.f);
+    for (auto& n : v)
+    {
+        if (any && ! n.selected) continue;
+        if (targets++ == 0) val = field == 0 ? n.glideMs : (field == 1 ? n.glideSmooth : (field == 2 ? n.drift : n.vibrato));
+    }
+    return val;
+}
+
 void NoteEditor::undo()
 {
     if (undoStack.empty()) { proc.undoClear(); return; }      // nothing to step back: bring back a cleared clip
@@ -654,54 +707,258 @@ void NoteEditor::undo()
     undoStack.pop_back();
 }
 
-// ===================================================================== Air window
-AirPanel::AirPanel (RetuneProcessor& p)
+// ===================================================================== Effects window
+namespace
 {
-    auto setup = [this] (juce::Slider& s, juce::Label& l, const juce::String& t)
+    enum class Fmt { Pct, Db, Hz, Ms, Ratio, Cents, Pct200 };
+
+    struct Knob
     {
-        s.setSliderStyle (juce::Slider::RotaryHorizontalVerticalDrag);
-        s.setTextBoxStyle (juce::Slider::TextBoxBelow, false, 70, 20);
-        s.setRotaryParameters (juce::MathConstants<float>::pi * 1.2f, juce::MathConstants<float>::pi * 2.8f, true);
-        s.setDoubleClickReturnValue (true, 0.0);
-        l.setText (t, juce::dontSendNotification);
-        l.setJustificationType (juce::Justification::centred);
-        l.setFont (juce::Font (juce::FontOptions (14.f, juce::Font::bold)));
-        l.attachToComponent (&s, false);
+        const char* id;            // parameter id, or nullptr for a per-note field
+        const char* label;
+        Fmt fmt;
+        int field = -1;            // per-note field (see NoteEditor::setShape)
+        double lo = 0.0, hi = 1.0, def = 0.0;
+    };
+
+    struct Page
+    {
+        const char* name;
+        const char* onId;
+        const char* desc;
+        std::vector<Knob> knobs;
+        const char* choiceId = nullptr;
+        const char* choiceLabel = nullptr;
+    };
+
+    const std::vector<Page>& pages()
+    {
+        static const std::vector<Page> p {
+            { "Note Glide", "glideOn",
+              "Portamento into each note from the one before it. Applies to the selected notes (all notes if none are selected).",
+              { { nullptr, "Glide Time", Fmt::Ms, 0, 0.0, 500.0, 0.0 }, { nullptr, "Smoothness", Fmt::Pct, 1, 0.0, 1.0, 0.5 } } },
+            { "Drift & Vibrato", "shapeOn",
+              "Scale the slow pitch drift and the vibrato as sung: 0% flattens it, 100% leaves it, 200% exaggerates it. Applies to the selected notes (all if none).",
+              { { nullptr, "Drift", Fmt::Pct200, 2, 0.0, 2.0, 1.0 }, { nullptr, "Vibrato", Fmt::Pct200, 3, 0.0, 2.0, 1.0 } } },
+            { "De-Esser", "deessOn",
+              "Turns down harsh S, T and SH sounds without dulling the rest of the voice.",
+              { { "deessThresh", "Threshold", Fmt::Db }, { "deessFreq", "Frequency", Fmt::Hz }, { "deessRange", "Max Reduction", Fmt::Db } } },
+            { "Compressor", "compOn",
+              "Smooth, natural-sounding vocal levelling with automatic make-up gain.",
+              { { "compThresh", "Threshold", Fmt::Db }, { "compRatio", "Ratio", Fmt::Ratio }, { "compAttack", "Attack", Fmt::Ms },
+                { "compRelease", "Release", Fmt::Ms }, { "compMix", "Mix", Fmt::Pct } } },
+            { "Air", "airOn",
+              "Adds high-frequency sheen and presence.",
+              { { "midAir", "Mid Air", Fmt::Pct }, { "highAir", "High Air", Fmt::Pct } } },
+            { "Choir", "choirOn",
+              "Turns the vocal into a choir: bass an octave down, alto at pitch, soprano an octave up. The shares set how many singers each section gets.",
+              { { "choirSize", "Size", Fmt::Pct }, { "choirBass", "Bass Share", Fmt::Pct }, { "choirAlto", "Alto Share", Fmt::Pct },
+                { "choirSop", "Soprano Share", Fmt::Pct }, { "choirMix", "Mix", Fmt::Pct }, { "choirBassVol", "Bass Volume", Fmt::Db },
+                { "choirAltoVol", "Alto Volume", Fmt::Db }, { "choirSopVol", "Soprano Volume", Fmt::Db } } },
+            { "Doubler", "doubleOn",
+              "Double-tracked vocal: two detuned, slightly late copies spread left and right.",
+              { { "doubleWidth", "Width", Fmt::Pct }, { "doubleDetune", "Detune", Fmt::Cents }, { "doubleMix", "Mix", Fmt::Pct } } },
+            { "Echo", "echoOn",
+              "Tempo-synced echo with a darker repeat on each pass.",
+              { { "echoFeedback", "Feedback", Fmt::Pct }, { "echoTone", "Tone", Fmt::Hz }, { "echoMix", "Mix", Fmt::Pct } },
+              "echoTime", "Time" },
+            { "Reverb", "verbOn",
+              "Room / plate style reverb to place the vocal in a space.",
+              { { "verbSize", "Size", Fmt::Pct }, { "verbDamp", "Damping", Fmt::Pct }, { "verbWidth", "Width", Fmt::Pct },
+                { "verbMix", "Mix", Fmt::Pct } } },
+        };
+        return p;
+    }
+
+    juce::String formatValue (Fmt f, double v)
+    {
+        switch (f)
+        {
+            case Fmt::Pct:    return juce::String ((int) std::lround (v * 100.0)) + "%";
+            case Fmt::Pct200: return juce::String ((int) std::lround (v * 100.0)) + "%";
+            case Fmt::Db:     return juce::String (v, 1) + " dB";
+            case Fmt::Hz:     return v >= 1000.0 ? juce::String (v / 1000.0, 1) + " kHz" : juce::String ((int) std::lround (v)) + " Hz";
+            case Fmt::Ms:     return juce::String (v, v < 10.0 ? 1 : 0) + " ms";
+            case Fmt::Ratio:  return juce::String (v, 1) + ":1";
+            case Fmt::Cents:  return juce::String (v, 1) + " ct";
+        }
+        return juce::String (v);
+    }
+
+    double parseValue (Fmt f, const juce::String& t)
+    {
+        const double v = t.retainCharacters ("0123456789.-").getDoubleValue();
+        if (f == Fmt::Pct || f == Fmt::Pct200) return v / 100.0;
+        if (f == Fmt::Hz && t.containsIgnoreCase ("k")) return v * 1000.0;
+        return v;
+    }
+}
+
+int FxPanel::numPages() { return (int) pages().size(); }
+juce::String FxPanel::pageName (int i) { return pages()[(size_t) i].name; }
+juce::String FxPanel::pageOnParam (int i) { return pages()[(size_t) i].onId; }
+
+FxPanel::FxPanel (RetuneProcessor& p, NoteEditor& ed) : proc (p), editor (ed)
+{
+    for (int i = 0; i < numPages(); ++i) pageBox.addItem (pageName (i), i + 1);
+    pageBox.onChange = [this] { showPage (pageBox.getSelectedItemIndex()); };
+    addAndMakeVisible (pageBox);
+    addAndMakeVisible (onBtn);
+    info.setColour (juce::Label::textColourId, Theme::dim);
+    info.setFont (juce::FontOptions (12.f));
+    info.setJustificationType (juce::Justification::topLeft);
+    addAndMakeVisible (info);
+    setSize (600, 380);
+    showPage (0);
+    startTimerHz (12);
+}
+
+FxPanel::~FxPanel()
+{
+    onAtt.reset();
+    knobAtts.clear();
+    choiceAtt.reset();
+}
+
+void FxPanel::showPage (int pg)
+{
+    pg = juce::jlimit (0, numPages() - 1, pg);
+    if (pg == page && ! knobs.isEmpty()) return;
+    page = pg;
+    pageBox.setSelectedItemIndex (page, juce::dontSendNotification);
+    buildPage();
+}
+
+void FxPanel::buildPage()
+{
+    const auto& pd = pages()[(size_t) page];
+    onAtt.reset();
+    knobAtts.clear();
+    knobs.clear();
+    knobLabels.clear();
+    choiceAtt.reset(); choice.reset(); choiceLabel.reset();
+    shapeField.clear();
+
+    onAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, pd.onId, onBtn);
+    info.setText (pd.desc, juce::dontSendNotification);
+
+    for (const auto& k : pd.knobs)
+    {
+        auto* s = knobs.add (new juce::Slider (juce::Slider::RotaryHorizontalVerticalDrag, juce::Slider::TextBoxBelow));
+        s->setTextBoxStyle (juce::Slider::TextBoxBelow, false, 80, 18);
+        s->setRotaryParameters (juce::MathConstants<float>::pi * 1.2f, juce::MathConstants<float>::pi * 2.8f, true);
+        auto* l = knobLabels.add (new juce::Label ({}, k.label));
+        l->setJustificationType (juce::Justification::centred);
+        l->setFont (juce::Font (juce::FontOptions (12.5f, juce::Font::bold)));
         addAndMakeVisible (s);
         addAndMakeVisible (l);
-    };
-    setup (mid, midL, "Mid Air");
-    setup (high, highL, "High Air");
-    addAndMakeVisible (on);
+        shapeField.push_back (k.id == nullptr ? k.field : -1);
 
-    aMid  = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (p.apvts, "midAir", mid);
-    aHigh = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (p.apvts, "highAir", high);
-    aOn   = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (p.apvts, "airOn", on);
-    for (auto* s : { &mid, &high })           // the attachments install their own text; show plain percentages instead
-    {
-        s->textFromValueFunction = [] (double v) { return juce::String ((int) std::lround (v * 100.0)) + "%"; };
-        s->valueFromTextFunction = [] (const juce::String& t) { return t.getDoubleValue() / 100.0; };
+        if (k.id != nullptr)
+        {
+            knobAtts.add (new juce::AudioProcessorValueTreeState::SliderAttachment (proc.apvts, k.id, *s));
+            if (auto* prm = proc.apvts.getParameter (k.id))
+                s->setDoubleClickReturnValue (true, prm->convertFrom0to1 (prm->getDefaultValue()));
+        }
+        else
+        {
+            const int field = k.field;
+            s->setRange (k.lo, k.hi, 0.0);
+            s->setDoubleClickReturnValue (true, k.def);
+            s->onDragStart = [this] { shapeDragging = true; editor.beginShapeEdit(); };
+            s->onDragEnd   = [this] { shapeDragging = false; editor.endShapeEdit(); };
+            s->onValueChange = [this, s, field]
+            {
+                if (shapeDragging) { editor.setShape (field, (float) s->getValue()); return; }
+                editor.beginShapeEdit();                    // typed value or double-click reset
+                editor.setShape (field, (float) s->getValue());
+                editor.endShapeEdit();
+            };
+        }
+        const Fmt f = k.fmt;
+        s->textFromValueFunction = [f] (double v) { return formatValue (f, v); };
+        s->valueFromTextFunction = [f] (const juce::String& t) { return parseValue (f, t); };
         s->updateText();
     }
-    setSize (380, 270);
+
+    if (pd.choiceId != nullptr)
+    {
+        choice = std::make_unique<juce::ComboBox>();
+        if (auto* c = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter (pd.choiceId)))
+            choice->addItemList (c->choices, 1);
+        choiceAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, pd.choiceId, *choice);
+        choiceLabel = std::make_unique<juce::Label> (juce::String(), pd.choiceLabel);
+        choiceLabel->setJustificationType (juce::Justification::centred);
+        choiceLabel->setFont (juce::Font (juce::FontOptions (12.5f, juce::Font::bold)));
+        addAndMakeVisible (*choice);
+        addAndMakeVisible (*choiceLabel);
+    }
+    timerCallback();
+    resized();
+    repaint();
 }
 
-void AirPanel::paint (juce::Graphics& g)
+void FxPanel::timerCallback()
+{
+    if (shapeDragging) return;
+    int targets = 0;
+    for (int i = 0; i < knobs.size(); ++i)
+        if (shapeField[(size_t) i] >= 0)
+            knobs[i]->setValue (editor.shapeValue (shapeField[(size_t) i], targets), juce::dontSendNotification);
+    repaint (0, getHeight() - 30, getWidth(), 30);
+}
+
+void FxPanel::paint (juce::Graphics& g)
 {
     g.fillAll (Theme::panel);
-    g.setColour (Theme::text);
-    g.setFont (juce::FontOptions (20.f, juce::Font::bold));
-    g.drawText ("Air", 20, 14, 120, 26, juce::Justification::centredLeft);
+    g.setColour (Theme::border);
+    g.fillRect (0, 52, getWidth(), 1);
+
+    juce::String foot;
+    if (page == 0 || page == 1)
+    {
+        int targets = 0;
+        editor.shapeValue (0, targets);
+        bool any = false;
+        for (const auto& n : proc.getNotes()) any = any || n.selected;
+        foot = targets == 0 ? juce::String ("No notes yet")
+                            : (any ? "Editing " + juce::String (targets) + " selected note" + (targets == 1 ? "" : "s")
+                                   : "Editing all " + juce::String (targets) + " notes");
+    }
+    else if (page == 2) foot = "Reduction: " + juce::String (proc.deessReduction(), 1) + " dB";
+    else if (page == 3) foot = "Gain reduction: " + juce::String (proc.compReduction(), 1) + " dB";
     g.setColour (Theme::dim);
     g.setFont (juce::FontOptions (12.f));
-    g.drawText ("Adds high-frequency sheen to the plugin's output", 20, 40, 340, 16, juce::Justification::centredLeft);
+    g.drawText (foot, 20, getHeight() - 26, getWidth() - 40, 18, juce::Justification::centredLeft);
 }
 
-void AirPanel::resized()
+void FxPanel::resized()
 {
-    on.setBounds (getWidth() - 110, 16, 96, 24);
-    mid.setBounds  (30, 96, 150, 150);
-    high.setBounds (getWidth() - 180, 96, 150, 150);
+    pageBox.setBounds (16, 13, 200, 28);
+    onBtn.setBounds (230, 15, 70, 24);
+    info.setBounds (16, 58, getWidth() - 32, 36);
+
+    const int n = knobs.size() + (choice != nullptr ? 1 : 0);
+    const int cols = juce::jmin (5, juce::jmax (1, n)), rows = (n + cols - 1) / juce::jmax (1, cols);
+    const int cw = 108, ch = 124, top = 100;
+    const int x0 = (getWidth() - cols * cw) / 2;
+    for (int i = 0; i < n; ++i)
+    {
+        const int r = i / cols, c = i % cols;
+        juce::Rectangle<int> cell (x0 + c * cw, top + r * ch, cw, ch);
+        auto lab = cell.removeFromTop (18);
+        if (i < knobs.size())
+        {
+            knobLabels[i]->setBounds (lab);
+            knobs[i]->setBounds (cell.reduced (8, 0));
+        }
+        else
+        {
+            choiceLabel->setBounds (lab);
+            choice->setBounds (cell.withSizeKeepingCentre (cw - 12, 26));
+        }
+    }
+    juce::ignoreUnused (rows);
 }
 
 // ===================================================================== Hotkey window
@@ -789,7 +1046,7 @@ RetuneEditor::RetuneEditor (RetuneProcessor& p)
     snapBtn.onClick  = [this] { noteEditor.snapAll (true); };
     snapSemiBtn.onClick = [this] { noteEditor.snapAll (false); };
     clearBtn.onClick = [this] { proc.clearClip(); };
-    airBtn.onClick   = [this] { showAir(); };
+    fxBtn.onClick    = [this] { showEffectsMenu(); };
     keysBtn.onClick  = [this] { showHotkeys(); };
 
     keyBox.addItemList ({ "C","C#","D","D#","E","F","F#","G","G#","A","A#","B" }, 1);
@@ -799,7 +1056,7 @@ RetuneEditor::RetuneEditor (RetuneProcessor& p)
     keyBox.onChange = scaleBox.onChange = [this] { updateScale(); };
 
     for (auto* c : std::initializer_list<juce::Component*> { &recBtn, &editBtn, &splitBtn, &undoBtn, &snapBtn, &snapSemiBtn, &clearBtn,
-                                                              &airBtn, &keysBtn, &keyBox, &scaleBox, &statusLabel })
+                                                              &fxBtn, &keysBtn, &keyBox, &scaleBox, &statusLabel })
     {
         c->setWantsKeyboardFocus (false);           // keep keyboard shortcuts flowing to the note editor
         addAndMakeVisible (c);
@@ -823,7 +1080,7 @@ RetuneEditor::RetuneEditor (RetuneProcessor& p)
 
 RetuneEditor::~RetuneEditor()
 {
-    airWin.reset();
+    fxWin.reset();
     keyWin.reset();
     setLookAndFeel (nullptr);
 }
@@ -840,20 +1097,51 @@ void RetuneEditor::selectTool (bool split)
     noteEditor.setTool (split ? NoteEditor::Tool::Split : NoteEditor::Tool::Edit);
 }
 
-void RetuneEditor::showAir()
+void RetuneEditor::showEffectsMenu()
 {
-    if (airWin == nullptr)
+    juce::PopupMenu m;
+    m.addSectionHeader ("Notes");
+    for (int i = 0; i < FxPanel::numPages(); ++i)
     {
-        airWin = std::make_unique<ToolWindow> ("Air");
-        airWin->setLookAndFeel (&laf);
-        airWin->setContentOwned (new AirPanel (proc), true);
-        airWin->setUsingNativeTitleBar (true);
-        airWin->setResizable (false, false);
-        airWin->setAlwaysOnTop (true);
-        airWin->centreAroundComponent (this, airWin->getWidth(), airWin->getHeight());
+        if (i == 2) m.addSectionHeader ("Vocal effects");
+        auto* prm = proc.apvts.getParameter (FxPanel::pageOnParam (i));
+        const bool on = prm != nullptr && prm->getValue() > 0.5f;
+        m.addItem (juce::PopupMenu::Item (FxPanel::pageName (i)).setID (i + 1).setTicked (on));
     }
-    airWin->setVisible (true);
-    airWin->toFront (true);
+    m.addSeparator();
+    m.addItem (100, "Turn all vocal effects off");
+
+    juce::Component::SafePointer<RetuneEditor> safe (this);
+    m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&fxBtn), [safe] (int r)
+    {
+        if (safe == nullptr || r == 0) return;
+        if (r == 100)
+        {
+            for (int i = 2; i < FxPanel::numPages(); ++i)
+                if (auto* prm = safe->proc.apvts.getParameter (FxPanel::pageOnParam (i)))
+                    prm->setValueNotifyingHost (0.f);
+            return;
+        }
+        safe->showEffects (r - 1);
+    });
+}
+
+void RetuneEditor::showEffects (int pg)
+{
+    if (fxWin == nullptr)
+    {
+        fxWin = std::make_unique<ToolWindow> ("Effects");
+        fxWin->setLookAndFeel (&laf);
+        fxPanel = new FxPanel (proc, noteEditor);
+        fxWin->setContentOwned (fxPanel, true);
+        fxWin->setUsingNativeTitleBar (true);
+        fxWin->setResizable (false, false);
+        fxWin->setAlwaysOnTop (true);
+        fxWin->centreAroundComponent (this, fxWin->getWidth(), fxWin->getHeight());
+    }
+    fxPanel->showPage (pg);
+    fxWin->setVisible (true);
+    fxWin->toFront (true);
 }
 
 void RetuneEditor::showHotkeys()
@@ -921,7 +1209,7 @@ void RetuneEditor::resized()
     scaleBox.setBounds (bar.removeFromLeft (140));  bar.removeFromLeft (gap);
     snapBtn.setBounds  (bar.removeFromLeft (118));  bar.removeFromLeft (4);
     snapSemiBtn.setBounds (bar.removeFromLeft (138)); bar.removeFromLeft (gap + 6);
-    airBtn.setBounds   (bar.removeFromLeft (54));   bar.removeFromLeft (gap);
+    fxBtn.setBounds    (bar.removeFromLeft (76));   bar.removeFromLeft (gap);
     keysBtn.setBounds  (bar.removeFromLeft (78));   bar.removeFromLeft (gap);
     clearBtn.setBounds (bar.removeFromLeft (58));
     statusLabel.setBounds (bar);

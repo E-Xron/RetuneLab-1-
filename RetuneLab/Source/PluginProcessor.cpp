@@ -25,25 +25,115 @@ RetuneProcessor::RetuneProcessor()
           .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "STATE", createLayout())
 {
-    airOnP   = apvts.getRawParameterValue ("airOn");
-    midAirP  = apvts.getRawParameterValue ("midAir");
-    highAirP = apvts.getRawParameterValue ("highAir");
+    apvts.addParameterListener ("glideOn", this);
+    apvts.addParameterListener ("shapeOn", this);
     for (auto& s : source) s.assign ((size_t) (60 * 48000), 0.f);
     worker = std::make_unique<Worker> (*this);
     worker->startThread();
 }
 
-RetuneProcessor::~RetuneProcessor() { worker->stopThread (3000); }
+RetuneProcessor::~RetuneProcessor()
+{
+    apvts.removeParameterListener ("glideOn", this);
+    apvts.removeParameterListener ("shapeOn", this);
+    worker->stopThread (3000);
+}
+
+void RetuneProcessor::parameterChanged (const juce::String&, float) { requestRender(); }
+
+RenderOptions RetuneProcessor::renderOptions() const
+{
+    RenderOptions o;
+    o.glide = pv ("glideOn") > 0.5f;
+    o.shape = pv ("shapeOn") > 0.5f;
+    return o;
+}
 
 juce::AudioProcessorValueTreeState::ParameterLayout RetuneProcessor::createLayout()
 {
     std::vector<std::unique_ptr<juce::RangedAudioParameter>> p;
-    p.push_back (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { "airOn", 1 }, "Air On", true));
-    p.push_back (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "midAir", 1 }, "Mid Air",
-        juce::NormalisableRange<float> (0.f, 1.f, 0.001f), 0.f));
-    p.push_back (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { "highAir", 1 }, "High Air",
-        juce::NormalisableRange<float> (0.f, 1.f, 0.001f), 0.f));
+    auto onOff = [&] (const char* id, const char* name, bool def)
+    {
+        p.push_back (std::make_unique<juce::AudioParameterBool> (juce::ParameterID { id, 1 }, name, def));
+    };
+    auto num = [&] (const char* id, const char* name, float lo, float hi, float def, const char* unit = "", float skewCentre = 0.f)
+    {
+        juce::NormalisableRange<float> r (lo, hi, 0.f);
+        if (skewCentre > 0.f) r.setSkewForCentre (skewCentre);
+        p.push_back (std::make_unique<juce::AudioParameterFloat> (juce::ParameterID { id, 1 }, name, r, def,
+                     juce::AudioParameterFloatAttributes().withLabel (unit)));
+    };
+
+    onOff ("glideOn", "Note Glide On", true);
+    onOff ("shapeOn", "Drift & Vibrato On", true);
+
+    onOff ("deessOn", "De-Esser On", false);
+    num ("deessThresh", "De-Esser Threshold", -60.f, 0.f, -30.f, "dB");
+    num ("deessFreq",   "De-Esser Frequency", 3000.f, 12000.f, 6500.f, "Hz", 6500.f);
+    num ("deessRange",  "De-Esser Max Reduction", 0.f, 24.f, 10.f, "dB");
+
+    onOff ("compOn", "Compressor On", false);
+    num ("compThresh",  "Compressor Threshold", -50.f, 0.f, -18.f, "dB");
+    num ("compRatio",   "Compressor Ratio", 1.f, 10.f, 3.f, ":1", 3.f);
+    num ("compAttack",  "Compressor Attack", 0.5f, 50.f, 8.f, "ms", 8.f);
+    num ("compRelease", "Compressor Release", 20.f, 600.f, 120.f, "ms", 120.f);
+    num ("compMix",     "Compressor Mix", 0.f, 1.f, 1.f);
+
+    onOff ("airOn", "Air On", true);
+    num ("midAir",  "Mid Air", 0.f, 1.f, 0.f);
+    num ("highAir", "High Air", 0.f, 1.f, 0.f);
+
+    onOff ("choirOn", "Choir On", false);
+    num ("choirSize",    "Choir Size", 0.f, 1.f, 0.5f);
+    num ("choirBass",    "Choir Bass Share", 0.f, 1.f, 0.3f);
+    num ("choirAlto",    "Choir Alto Share", 0.f, 1.f, 0.4f);
+    num ("choirSop",     "Choir Soprano Share", 0.f, 1.f, 0.3f);
+    num ("choirBassVol", "Choir Bass Volume", -36.f, 6.f, 0.f, "dB");
+    num ("choirAltoVol", "Choir Alto Volume", -36.f, 6.f, 0.f, "dB");
+    num ("choirSopVol",  "Choir Soprano Volume", -36.f, 6.f, -3.f, "dB");
+    num ("choirMix",     "Choir Mix", 0.f, 1.f, 0.5f);
+
+    onOff ("doubleOn", "Doubler On", false);
+    num ("doubleWidth",  "Doubler Width", 0.f, 1.f, 0.8f);
+    num ("doubleDetune", "Doubler Detune", 0.f, 30.f, 9.f, "cents");
+    num ("doubleMix",    "Doubler Mix", 0.f, 1.f, 0.5f);
+
+    onOff ("echoOn", "Echo On", false);
+    {
+        juce::StringArray divs;
+        for (int i = 0; i < vfx::Echo::numDivisions(); ++i) divs.add (vfx::Echo::divisionName (i));
+        p.push_back (std::make_unique<juce::AudioParameterChoice> (juce::ParameterID { "echoTime", 1 }, "Echo Time", divs, 3));
+    }
+    num ("echoFeedback", "Echo Feedback", 0.f, 0.9f, 0.35f);
+    num ("echoMix",      "Echo Mix", 0.f, 1.f, 0.25f);
+    num ("echoTone",     "Echo Tone", 1000.f, 12000.f, 5000.f, "Hz", 4000.f);
+
+    onOff ("verbOn", "Reverb On", false);
+    num ("verbSize",  "Reverb Size", 0.f, 1.f, 0.6f);
+    num ("verbDamp",  "Reverb Damping", 0.f, 1.f, 0.5f);
+    num ("verbWidth", "Reverb Width", 0.f, 1.f, 1.f);
+    num ("verbMix",   "Reverb Mix", 0.f, 1.f, 0.25f);
     return { p.begin(), p.end() };
+}
+
+FxSettings RetuneProcessor::readFx (double bpm) const
+{
+    FxSettings s;
+    s.deessOn = pv ("deessOn") > 0.5f; s.deessThresh = pv ("deessThresh"); s.deessFreq = pv ("deessFreq"); s.deessRange = pv ("deessRange");
+    s.compOn = pv ("compOn") > 0.5f;   s.compThresh = pv ("compThresh"); s.compRatio = pv ("compRatio");
+    s.compAttack = pv ("compAttack");  s.compRelease = pv ("compRelease"); s.compMix = pv ("compMix");
+    s.airOn = pv ("airOn") > 0.5f;     s.midAir = pv ("midAir"); s.highAir = pv ("highAir");
+    s.choirOn = pv ("choirOn") > 0.5f; s.choirSize = pv ("choirSize");
+    s.choirWeight[0] = pv ("choirBass"); s.choirWeight[1] = pv ("choirAlto"); s.choirWeight[2] = pv ("choirSop");
+    s.choirVol[0] = pv ("choirBassVol"); s.choirVol[1] = pv ("choirAltoVol"); s.choirVol[2] = pv ("choirSopVol");
+    s.choirMix = pv ("choirMix");
+    s.doubleOn = pv ("doubleOn") > 0.5f; s.doubleWidth = pv ("doubleWidth"); s.doubleDetune = pv ("doubleDetune"); s.doubleMix = pv ("doubleMix");
+    s.echoOn = pv ("echoOn") > 0.5f;   s.echoDiv = (int) std::lround (pv ("echoTime"));
+    s.echoFeedback = pv ("echoFeedback"); s.echoMix = pv ("echoMix"); s.echoTone = pv ("echoTone");
+    s.verbOn = pv ("verbOn") > 0.5f;   s.verbSize = pv ("verbSize"); s.verbDamp = pv ("verbDamp");
+    s.verbWidth = pv ("verbWidth");    s.verbMix = pv ("verbMix");
+    s.bpm = bpm;
+    return s;
 }
 
 bool RetuneProcessor::isBusesLayoutSupported (const BusesLayout& l) const
@@ -56,7 +146,7 @@ bool RetuneProcessor::isBusesLayoutSupported (const BusesLayout& l) const
 void RetuneProcessor::prepareToPlay (double sampleRate, int)
 {
     sr = sampleRate;
-    airFx.prepare (sampleRate);
+    fx.prepare (sampleRate);
     const size_t needed = (size_t) (60.0 * sampleRate);
     for (auto& s : source) if (s.size() < needed) s.resize (needed, 0.f);
 }
@@ -68,10 +158,12 @@ void RetuneProcessor::processBlock (juce::AudioBuffer<float>& buf, juce::MidiBuf
 
     juce::int64 pos = 0;
     bool playing = false, havePos = false;
+    double bpm = 120.0;
     if (auto* ph = getPlayHead())
         if (auto info = ph->getPosition())
         {
             playing = info->getIsPlaying();
+            if (auto b = info->getBpm()) bpm = *b;
             if (auto t = info->getTimeInSamples()) { pos = *t; havePos = true; }
         }
     hostPos.store (pos);
@@ -133,7 +225,7 @@ void RetuneProcessor::processBlock (juce::AudioBuffer<float>& buf, juce::MidiBuf
         else { lastBuf = -1; fadeLeft = 0; fadeFrom = -1; }
     }
 
-    airFx.process (buf, airOnP->load() > 0.5f, midAirP->load(), highAirP->load());
+    fx.process (buf, readFx (bpm));
 }
 
 // ---------------------------------------------------------------- worker jobs
@@ -168,7 +260,7 @@ void RetuneProcessor::doRender()
 
     const float* ptrs[2] = { source[0].data(), source[1].data() };
     std::vector<std::vector<float>> out;
-    ClipEngine::render (ptrs, 2, len, sr.load(), nts, an, out);
+    ClipEngine::render (ptrs, 2, len, sr.load(), nts, an, renderOptions(), out);
 
     if (clipLen.load() <= 0) { status = Idle; return; }      // the clip was cleared while we were rendering
     const int a = activeBuf.load(), r = retiredBuf.load();
@@ -253,7 +345,7 @@ void RetuneProcessor::getStateInformation (juce::MemoryBlock& dest)
     juce::MemoryOutputStream o (dest, false);
     juce::ScopedLock sl (modelLock);
     const int len = juce::jmin (clipLen.load(), (int) source[0].size());
-    o.writeInt (0x52544c32);
+    o.writeInt (0x52544c33);
     o.writeDouble (sr.load());
     o.writeInt64 (clipOrigin.load());
     o.writeInt (len);
@@ -269,6 +361,10 @@ void RetuneProcessor::getStateInformation (juce::MemoryBlock& dest)
     o.writeInt (analysis.hop); o.writeInt (analysis.frameOffset); o.writeInt ((int) analysis.contour.size());
     for (float f : analysis.contour) o.writeFloat (f);
     o.writeInt (noteMask.load()); o.writeInt (keyRoot.load()); o.writeInt (keyScale.load());
+    for (const auto& n : notes)                                   // v3: glide + drift/vibrato per note
+    {
+        o.writeFloat (n.glideMs); o.writeFloat (n.glideSmooth); o.writeFloat (n.drift); o.writeFloat (n.vibrato);
+    }
     if (auto xml = apvts.copyState().createXml()) o.writeString (xml->toString()); else o.writeString ({});
 }
 
@@ -277,8 +373,9 @@ void RetuneProcessor::setStateInformation (const void* data, int size)
     if (size < 32) return;
     juce::MemoryInputStream in (data, (size_t) size, false);
     const int magic = in.readInt();
-    if (magic != 0x52544c31 && magic != 0x52544c32) return;
-    const bool v2 = (magic == 0x52544c32);                    // v2 also stores the key
+    if (magic != 0x52544c31 && magic != 0x52544c32 && magic != 0x52544c33) return;
+    const bool v2 = (magic != 0x52544c31);                    // v2 also stores the key
+    const bool v3 = (magic == 0x52544c33);                    // v3 also stores glide + drift/vibrato
     in.readDouble();
     const juce::int64 origin = in.readInt64();
     const int len = juce::jmin (in.readInt(), (int) source[0].size());
@@ -300,6 +397,11 @@ void RetuneProcessor::setStateInformation (const void* data, int size)
     {
         noteMask.store (in.readInt()); keyRoot.store (in.readInt()); keyScale.store (in.readInt());
     }
+    if (v3)
+        for (auto& n : nts)
+        {
+            n.glideMs = in.readFloat(); n.glideSmooth = in.readFloat(); n.drift = in.readFloat(); n.vibrato = in.readFloat();
+        }
     if (! in.isExhausted())
         if (auto xml = juce::XmlDocument::parse (in.readString()))
             apvts.replaceState (juce::ValueTree::fromXml (*xml));

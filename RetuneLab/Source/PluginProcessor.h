@@ -6,10 +6,10 @@
 #include <memory>
 #include <vector>
 #include "ClipEngine.h"
-#include "AirFx.h"
+#include "VocalFx.h"
 #include "Hotkeys.h"
 
-class RetuneProcessor : public juce::AudioProcessor
+class RetuneProcessor : public juce::AudioProcessor, private juce::AudioProcessorValueTreeState::Listener
 {
 public:
     enum Status { Idle = 0, Recording, Analysing, Rendering, Ready };
@@ -46,7 +46,7 @@ public:
     ClipAnalysis getAnalysis() const;
     void setNotes (std::vector<Note>);          // updates the model only; call requestRender() when done editing
 
-    juce::AudioProcessorValueTreeState apvts;   // Air parameters (automatable)
+    juce::AudioProcessorValueTreeState apvts;   // effect parameters (automatable)
     HotkeyMap hotkeys;
 
     // ---- state read by the UI ----
@@ -63,17 +63,20 @@ public:
     std::atomic<bool> keyPending { false };      // set after a fresh analysis: UI should auto-detect the key
 
     double getSr() const { return sr.load(); }
+    RenderOptions renderOptions() const;
+    float deessReduction() const { return fx.deessReduction(); }
+    float compReduction() const  { return fx.compReduction(); }
 
 private:
     class Worker;
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
     void doAnalyse();
     void doRender();
+    void parameterChanged (const juce::String&, float) override;   // Note Glide / Drift & Vibrato switches re-render
+    float pv (const char* id) const { return apvts.getRawParameterValue (id)->load(); }
+    FxSettings readFx (double bpm) const;
 
-    AirFx airFx;
-    std::atomic<float>* airOnP = nullptr;
-    std::atomic<float>* midAirP = nullptr;
-    std::atomic<float>* highAirP = nullptr;
+    FxChain fx;
 
     std::atomic<double> sr { 48000.0 };
     std::array<std::vector<float>, 2> source;                 // recorded clip (fixed capacity, ~60 s)
