@@ -155,94 +155,61 @@ namespace vfx
         float rms = 0.f, grDb = 0.f, slow = 0.f;
     };
 
-    // ---------------------------------------------------------------- Choir (auto-chorus)
-    // Turns one voice into a choir: a bass section an octave below, an alto section at the sung pitch and a soprano
-    // section an octave above. Each singer has its own timing, detune, slow pitch wander and stereo position.
-    class Choir
+    // ---------------------------------------------------------------- Choir (mix stage)
+    // The singers themselves are rendered offline from the recorded clip (ClipEngine::renderChoir), which keeps
+    // each voice's formants natural. Here the three sections are balanced, the harsh top and boomy bottom are
+    // trimmed, and the ensemble is placed in a hall so it blends like a real choir instead of a stack of copies.
+    class ChoirMix
     {
     public:
-        static constexpr int kMax = 24;
         void prepare (double s)
         {
             sr = s;
-            line.prepare ((int) (0.25 * sr));
-            lastKey = -1.f;
-            for (int i = 0; i < kMax; ++i) voices[(size_t) i].phase = rnd (i, 7);
+            for (auto& f : hp) { f.setHighPass (sr, 90.0); f.reset(); }
+            for (auto& f : lp) { f.setLowPass (sr, 7000.0, 0.6); f.reset(); }
+            for (auto& f : lp2) { f.setLowPass (sr, 11000.0, 0.7); f.reset(); }
+            hall.setSampleRate (sr); hall.reset();
         }
-        void reset() { line.reset(); }
-        // size 0..1, ratio weights 0..1 per section, volumes in dB
-        void process (float* const* d, int nch, int n, float size, const float weight[3], const float volDb[3], float mix)
+        void reset() { hall.reset(); for (auto& f : hp) f.reset(); for (auto& f : lp) f.reset(); for (auto& f : lp2) f.reset(); }
+        // in: 6 channels (bass L/R, alto L/R, soprano L/R) for this block, or nullptr outside the clip
+        void process (float* const* d, int nch, int n, const float* const* in, const float volDb[3], float mix, float room)
         {
-            layout (size, weight);
             float vol[3];
-            for (int s = 0; s < 3; ++s) vol[s] = dbToGain (volDb[s]) / std::sqrt ((float) std::max (1, count[s]));
+            for (int s2 = 0; s2 < 3; ++s2) vol[s2] = volDb[s2] <= -35.9f ? 0.f : dbToGain (volDb[s2]);
+            juce::Reverb::Parameters p;
+            p.roomSize = 0.55f + 0.35f * room; p.damping = 0.6f; p.width = 1.f;
+            p.wetLevel = 0.12f + 0.3f * room; p.dryLevel = 1.f - 0.45f * room; p.freezeMode = 0.f;
+            hall.setParameters (p);
+            float pk[3] = { 0.f, 0.f, 0.f };
             for (int i = 0; i < n; ++i)
             {
-                const float in = nch > 1 ? 0.5f * (d[0][i] + d[1][i]) : d[0][i];
-                line.push (in);
                 float l = 0.f, r = 0.f;
-                for (int v = 0; v < active; ++v)
-                {
-                    auto& vc = voices[(size_t) v];
-                    const float y = vc.process (line, sr) * vol[section[(size_t) v]];
-                    l += y * vc.gainL; r += y * vc.gainR;
-                }
-                if (nch > 1) { d[0][i] += mix * l; d[1][i] += mix * r; }
-                else d[0][i] += mix * 0.5f * (l + r);
+                if (in != nullptr)
+                    for (int s2 = 0; s2 < 3; ++s2)
+                    {
+                        const float a = in[s2 * 2][i] * vol[s2], b = in[s2 * 2 + 1][i] * vol[s2];
+                        l += a; r += b;
+                        pk[s2] = std::max (pk[s2], std::max (std::abs (a), std::abs (b)));
+                    }
+                bufL[(size_t) i] = lp2[0].process (lp[0].process (hp[0].process (l)));
+                bufR[(size_t) i] = lp2[1].process (lp[1].process (hp[1].process (r)));
             }
-        }
-    private:
-        static float rnd (int i, int salt)                     // deterministic 0..1, so the choir sounds the same every time
-        {
-            unsigned x = (unsigned) (i * 7919 + salt * 104729 + 12345);
-            x ^= x << 13; x ^= x >> 17; x ^= x << 5;
-            return (float) (x % 10000u) / 10000.f;
-        }
-        void layout (float size, const float w[3])
-        {
-            const float key = size * 1000.f + w[0] * 100.f + w[1] * 10.f + w[2];
-            if (key == lastKey) return;
-            lastKey = key;
-            const int total = 3 + (int) std::lround (size * (kMax - 3));
-            const float sum = w[0] + w[1] + w[2];
-            if (sum <= 1e-4f) { active = 0; count[0] = count[1] = count[2] = 0; return; }
-            // largest-remainder split of the singers between the sections
-            float exact[3]; int got = 0;
-            for (int s = 0; s < 3; ++s) { exact[s] = total * w[s] / sum; count[s] = (int) std::floor (exact[s]); got += count[s]; }
-            while (got < total)
+            for (int s2 = 0; s2 < 3; ++s2) levels[(size_t) s2].store (pk[s2] * mix);
+            hall.processStereo (bufL.data(), bufR.data(), n);
+            for (int i = 0; i < n; ++i)
             {
-                int best = 0;
-                for (int s = 1; s < 3; ++s) if (exact[s] - count[s] > exact[best] - count[best]) best = s;
-                ++count[best]; exact[best] = (float) count[best]; ++got;
+                if (nch > 1) { d[0][i] += mix * bufL[(size_t) i]; d[1][i] += mix * bufR[(size_t) i]; }
+                else d[0][i] += mix * 0.5f * (bufL[(size_t) i] + bufR[(size_t) i]);
             }
-            static const float semis[3] = { -12.f, 0.f, 12.f };
-            static const float winMs[3] = { 46.f, 34.f, 24.f };
-            const float spreadMs = 6.f + 34.f * size;            // bigger choir = wider timing spread
-            int v = 0;
-            for (int s = 0; s < 3; ++s)
-                for (int k = 0; k < count[s] && v < kMax; ++k, ++v)
-                {
-                    auto& vc = voices[(size_t) v];
-                    const float detune = (rnd (v, 1) - 0.5f) * (10.f + 14.f * size);         // cents
-                    vc.ratio = std::pow (2.f, (semis[s] + detune / 100.f) / 12.f);
-                    vc.window = winMs[s] * 0.001f * (float) sr;
-                    vc.baseDelay = (4.f + spreadMs * rnd (v, 2)) * 0.001f * (float) sr;
-                    vc.lfoRate = 0.08f + 0.3f * rnd (v, 3);
-                    vc.lfoDepth = 4.f + 6.f * rnd (v, 4);
-                    const float pan = count[s] == 1 ? 0.f : (rnd (v, 5) * 2.f - 1.f) * (0.35f + 0.6f * size);
-                    vc.gainL = std::cos ((pan + 1.f) * kPi * 0.25f);
-                    vc.gainR = std::sin ((pan + 1.f) * kPi * 0.25f);
-                    section[(size_t) v] = s;
-                }
-            active = v;
         }
-
+        static constexpr int kMaxBlock = 256;
+        float level (int section) const { return levels[(size_t) section].load(); }
+    private:
+        std::array<std::atomic<float>, 3> levels { { { 0.f }, { 0.f }, { 0.f } } };
         double sr = 48000.0;
-        DelayLine line;
-        std::array<ShiftVoice, kMax> voices;
-        std::array<int, kMax> section {};
-        int count[3] = { 0, 0, 0 }, active = 0;
-        float lastKey = -1.f;
+        std::array<Biquad, 2> hp, lp, lp2;
+        juce::Reverb hall;
+        std::array<float, kMaxBlock> bufL {}, bufR {};
     };
 
     // ---------------------------------------------------------------- Doubler
@@ -356,7 +323,8 @@ struct FxSettings
     bool  deessOn = false;  float deessThresh = -30.f, deessFreq = 6500.f, deessRange = 10.f;
     bool  compOn = false;   float compThresh = -18.f, compRatio = 3.f, compAttack = 8.f, compRelease = 120.f, compMix = 1.f;
     bool  airOn = true;     float midAir = 0.f, highAir = 0.f;
-    bool  choirOn = false;  float choirSize = 0.5f, choirWeight[3] = { 0.3f, 0.4f, 0.3f }, choirVol[3] = { 0.f, 0.f, 0.f }, choirMix = 0.5f;
+    bool  choirOn = false;  float choirVol[3] = { 0.f, 0.f, 0.f }, choirMix = 0.5f, choirRoom = 0.5f;
+    const float* const* choirIn = nullptr;   // this block's rendered choir sections (6 channels), or nullptr
     bool  doubleOn = false; float doubleWidth = 0.8f, doubleDetune = 9.f, doubleMix = 0.5f;
     bool  echoOn = false;   int echoDiv = 3; float echoFeedback = 0.35f, echoMix = 0.25f, echoTone = 5000.f;
     bool  verbOn = false;   float verbSize = 0.6f, verbDamp = 0.5f, verbWidth = 1.f, verbMix = 0.25f;
@@ -389,6 +357,7 @@ public:
         for (int off = 0; off < total; off += kChunk)
         {
             const int n = juce::jmin (kChunk, total - off);
+            chunkOffset = off;
             float* d[2] = { b.getWritePointer (0, off), nch > 1 ? b.getWritePointer (1, off) : nullptr };
             for (int k = 0; k < kSlots; ++k)
             {
@@ -401,7 +370,9 @@ public:
                 if (! f.isSmoothing() && f.getTargetValue() <= 0.f) continue;
                 float* w[2] = { wet[0].data(), wet[1].data() };
                 for (int c = 0; c < nch; ++c) std::copy (d[c], d[c] + n, w[c]);
+                const float before = k == 1 ? peak (w, nch, n) : 0.f;
                 runSlot (k, w, nch, n, s);
+                if (k == 1) { compIn.store (before); compOut.store (peak (w, nch, n)); }
                 for (int i = 0; i < n; ++i)
                 {
                     const float g = f.getNextValue();
@@ -413,9 +384,19 @@ public:
 
     float deessReduction() const { return deess.reductionDb(); }
     float compReduction() const  { return comp.reductionDb(); }
+    float choirLevel (int section) const { return choir.level (section); }
+
+    std::atomic<float> compIn { 0.f }, compOut { 0.f };      // peak levels around the compressor, for the meters
 
 private:
     static constexpr int kSlots = 6, kChunk = 256;
+
+    static float peak (float* const* d, int nch, int n)
+    {
+        float p = 0.f;
+        for (int c = 0; c < nch; ++c) for (int i = 0; i < n; ++i) p = std::max (p, std::abs (d[c][i]));
+        return p;
+    }
 
     void resetSlot (int k)
     {
@@ -433,7 +414,13 @@ private:
         {
             case 0: deess.process (w, nch, n, s.deessThresh, s.deessFreq, s.deessRange); break;
             case 1: comp.process (w, nch, n, s.compThresh, s.compRatio, s.compAttack, s.compRelease, s.compMix); break;
-            case 2: choir.process (w, nch, n, s.choirSize, s.choirWeight, s.choirVol, s.choirMix); break;
+            case 2:
+            {
+                const float* in[6] = {};
+                if (s.choirIn != nullptr) for (int c = 0; c < 6; ++c) in[c] = s.choirIn[c] + chunkOffset;
+                choir.process (w, nch, n, s.choirIn != nullptr ? in : nullptr, s.choirVol, s.choirMix, s.choirRoom);
+                break;
+            }
             case 3: doubler.process (w, nch, n, s.doubleWidth, s.doubleDetune, s.doubleMix); break;
             case 4: echo.process (w, nch, n, s.bpm, s.echoDiv, s.echoFeedback, s.echoMix, s.echoTone); break;
             case 5: verb.process (w, nch, n, s.verbSize, s.verbDamp, s.verbWidth, s.verbMix); break;
@@ -445,7 +432,8 @@ private:
     vfx::DeEsser deess;
     vfx::Compressor comp;
     AirFx air;
-    vfx::Choir choir;
+    vfx::ChoirMix choir;
+    int chunkOffset = 0;
     vfx::Doubler doubler;
     vfx::Echo echo;
     vfx::Reverb verb;

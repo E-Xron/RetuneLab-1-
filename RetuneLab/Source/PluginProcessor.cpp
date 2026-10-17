@@ -2,6 +2,12 @@
 #include "PluginEditor.h"
 #include <cmath>
 
+namespace
+{
+    // Parameters that change what gets rendered offline (note shaping and the choir singers).
+    const char* const kRenderParams[] = { "glideOn", "shapeOn", "choirOn", "choirSize", "choirBass", "choirAlto", "choirSop", "choirHarmony" };
+}
+
 class RetuneProcessor::Worker : public juce::Thread
 {
 public:
@@ -25,8 +31,8 @@ RetuneProcessor::RetuneProcessor()
           .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "STATE", createLayout())
 {
-    apvts.addParameterListener ("glideOn", this);
-    apvts.addParameterListener ("shapeOn", this);
+    for (auto* id : kRenderParams) apvts.addParameterListener (id, this);
+    activeNotes.setPitchClasses (2741);                           // C major
     for (auto& s : source) s.assign ((size_t) (60 * 48000), 0.f);
     worker = std::make_unique<Worker> (*this);
     worker->startThread();
@@ -34,8 +40,7 @@ RetuneProcessor::RetuneProcessor()
 
 RetuneProcessor::~RetuneProcessor()
 {
-    apvts.removeParameterListener ("glideOn", this);
-    apvts.removeParameterListener ("shapeOn", this);
+    for (auto* id : kRenderParams) apvts.removeParameterListener (id, this);
     worker->stopThread (3000);
 }
 
@@ -85,13 +90,15 @@ juce::AudioProcessorValueTreeState::ParameterLayout RetuneProcessor::createLayou
 
     onOff ("choirOn", "Choir On", false);
     num ("choirSize",    "Choir Size", 0.f, 1.f, 0.5f);
+    onOff ("choirHarmony", "Choir Alto Harmony", true);
+    num ("choirRoom",    "Choir Hall", 0.f, 1.f, 0.5f);
     num ("choirBass",    "Choir Bass Share", 0.f, 1.f, 0.3f);
     num ("choirAlto",    "Choir Alto Share", 0.f, 1.f, 0.4f);
     num ("choirSop",     "Choir Soprano Share", 0.f, 1.f, 0.3f);
     num ("choirBassVol", "Choir Bass Volume", -36.f, 6.f, 0.f, "dB");
     num ("choirAltoVol", "Choir Alto Volume", -36.f, 6.f, 0.f, "dB");
     num ("choirSopVol",  "Choir Soprano Volume", -36.f, 6.f, -3.f, "dB");
-    num ("choirMix",     "Choir Mix", 0.f, 1.f, 0.5f);
+    num ("choirMix",     "Choir Mix", 0.f, 1.f, 0.7f);
 
     onOff ("doubleOn", "Doubler On", false);
     num ("doubleWidth",  "Doubler Width", 0.f, 1.f, 0.8f);
@@ -116,6 +123,28 @@ juce::AudioProcessorValueTreeState::ParameterLayout RetuneProcessor::createLayou
     return { p.begin(), p.end() };
 }
 
+ChoirSpec RetuneProcessor::choirSpec() const
+{
+    ChoirSpec c;
+    c.size = pv ("choirSize");
+    c.harmony = pv ("choirHarmony") > 0.5f;
+    for (int n = 0; n < 128; ++n) c.allowed[(size_t) n] = activeNotes.get (n);
+    const float w[3] = { pv ("choirBass"), pv ("choirAlto"), pv ("choirSop") };
+    const float sum = w[0] + w[1] + w[2];
+    if (sum <= 1e-4f) return c;
+    const int total = 3 + (int) std::lround (c.size * 13.f);        // 3..16 singers
+    float exact[3];
+    int got = 0;
+    for (int i = 0; i < 3; ++i) { exact[i] = (float) total * w[i] / sum; c.singers[i] = (int) std::floor (exact[i]); got += c.singers[i]; }
+    while (got < total)                                             // largest remainder split between the sections
+    {
+        int best = 0;
+        for (int i = 1; i < 3; ++i) if (exact[i] - (float) c.singers[i] > exact[best] - (float) c.singers[best]) best = i;
+        ++c.singers[best]; exact[best] = (float) c.singers[best]; ++got;
+    }
+    return c;
+}
+
 FxSettings RetuneProcessor::readFx (double bpm) const
 {
     FxSettings s;
@@ -123,8 +152,7 @@ FxSettings RetuneProcessor::readFx (double bpm) const
     s.compOn = pv ("compOn") > 0.5f;   s.compThresh = pv ("compThresh"); s.compRatio = pv ("compRatio");
     s.compAttack = pv ("compAttack");  s.compRelease = pv ("compRelease"); s.compMix = pv ("compMix");
     s.airOn = pv ("airOn") > 0.5f;     s.midAir = pv ("midAir"); s.highAir = pv ("highAir");
-    s.choirOn = pv ("choirOn") > 0.5f; s.choirSize = pv ("choirSize");
-    s.choirWeight[0] = pv ("choirBass"); s.choirWeight[1] = pv ("choirAlto"); s.choirWeight[2] = pv ("choirSop");
+    s.choirOn = pv ("choirOn") > 0.5f; s.choirRoom = pv ("choirRoom");
     s.choirVol[0] = pv ("choirBassVol"); s.choirVol[1] = pv ("choirAltoVol"); s.choirVol[2] = pv ("choirSopVol");
     s.choirMix = pv ("choirMix");
     s.doubleOn = pv ("doubleOn") > 0.5f; s.doubleWidth = pv ("doubleWidth"); s.doubleDetune = pv ("doubleDetune"); s.doubleMix = pv ("doubleMix");
@@ -143,10 +171,11 @@ bool RetuneProcessor::isBusesLayoutSupported (const BusesLayout& l) const
            && o == l.getMainInputChannelSet();
 }
 
-void RetuneProcessor::prepareToPlay (double sampleRate, int)
+void RetuneProcessor::prepareToPlay (double sampleRate, int blockSize)
 {
     sr = sampleRate;
     fx.prepare (sampleRate);
+    for (auto& c : choirScratch) c.assign ((size_t) juce::jmax (blockSize, 4096), 0.f);
     const size_t needed = (size_t) (60.0 * sampleRate);
     for (auto& s : source) if (s.size() < needed) s.resize (needed, 0.f);
 }
@@ -170,6 +199,8 @@ void RetuneProcessor::processBlock (juce::AudioBuffer<float>& buf, juce::MidiBuf
     hostPlaying.store (playing);
 
     const int n = buf.getNumSamples(), nch = juce::jmin (buf.getNumChannels(), 2);
+    hostBpm.store (bpm);
+    for (int c = 0; c < 2; ++c) inLevel[c].store (c < nch ? buf.getMagnitude (c, 0, n) : 0.f);
     const bool rec = recordArmed.load();
     if (! rec) originSet = false;
 
@@ -203,7 +234,7 @@ void RetuneProcessor::processBlock (juce::AudioBuffer<float>& buf, juce::MidiBuf
                 lastBuf = ai;
             }
             const auto& rb = renderBuf[(size_t) ai];
-            const std::array<std::vector<float>, 2>* ob = fadeFrom >= 0 ? &renderBuf[(size_t) fadeFrom] : nullptr;
+            const auto* ob = fadeFrom >= 0 ? &renderBuf[(size_t) fadeFrom] : nullptr;
             const juce::int64 len = (juce::int64) rb[0].size(), o = clipOrigin.load();
             for (int i = 0; i < n; ++i)
             {
@@ -225,7 +256,34 @@ void RetuneProcessor::processBlock (juce::AudioBuffer<float>& buf, juce::MidiBuf
         else { lastBuf = -1; fadeLeft = 0; fadeFrom = -1; }
     }
 
-    fx.process (buf, readFx (bpm));
+    // choir sections for this block (rendered with the clip), only while the edited clip is playing
+    const float* choirPtrs[6] = {};
+    bool haveChoir = false;
+    {
+        const int ai = activeBuf.load (std::memory_order_acquire);
+        if (! rec && playing && havePos && ai >= 0 && n <= (int) choirScratch[0].size()
+            && ! renderBuf[(size_t) ai][2].empty())
+        {
+            const auto& rb = renderBuf[(size_t) ai];
+            const juce::int64 len = (juce::int64) rb[2].size(), o = clipOrigin.load();
+            for (int c = 0; c < 6; ++c)
+            {
+                float* dst = choirScratch[(size_t) c].data();
+                for (int i = 0; i < n; ++i)
+                {
+                    const juce::int64 idx = pos + i - o;
+                    dst[i] = (idx >= 0 && idx < len) ? rb[(size_t) c + 2][(size_t) idx] : 0.f;
+                }
+                choirPtrs[c] = dst;
+            }
+            haveChoir = true;
+        }
+    }
+
+    auto fs = readFx (bpm);
+    fs.choirIn = haveChoir ? choirPtrs : nullptr;
+    fx.process (buf, fs);
+    for (int c = 0; c < 2; ++c) outLevel[c].store (buf.getMagnitude (juce::jmin (c, nch - 1), 0, n));
 }
 
 // ---------------------------------------------------------------- worker jobs
@@ -261,6 +319,13 @@ void RetuneProcessor::doRender()
     const float* ptrs[2] = { source[0].data(), source[1].data() };
     std::vector<std::vector<float>> out;
     ClipEngine::render (ptrs, 2, len, sr.load(), nts, an, renderOptions(), out);
+    std::vector<std::vector<float>> choir;
+    if (pv ("choirOn") > 0.5f)
+    {
+        const auto spec = choirSpec();
+        if (spec.singers[0] + spec.singers[1] + spec.singers[2] > 0)
+            ClipEngine::renderChoir (ptrs, 2, len, sr.load(), nts, an, renderOptions(), spec, choir);
+    }
 
     if (clipLen.load() <= 0) { status = Idle; return; }      // the clip was cleared while we were rendering
     const int a = activeBuf.load(), r = retiredBuf.load();
@@ -268,6 +333,8 @@ void RetuneProcessor::doRender()
     for (int i = 0; i < 3; ++i) if (i != a && i != r) { pick = i; break; }
     renderBuf[(size_t) pick][0] = std::move (out[0]);
     renderBuf[(size_t) pick][1] = std::move (out[1]);
+    for (int c = 0; c < 6; ++c)
+        renderBuf[(size_t) pick][(size_t) c + 2] = choir.empty() ? std::vector<float>() : std::move (choir[(size_t) c]);
     retiredBuf.store (a);
     activeBuf.store (pick, std::memory_order_release);
     status = Ready;
@@ -345,7 +412,7 @@ void RetuneProcessor::getStateInformation (juce::MemoryBlock& dest)
     juce::MemoryOutputStream o (dest, false);
     juce::ScopedLock sl (modelLock);
     const int len = juce::jmin (clipLen.load(), (int) source[0].size());
-    o.writeInt (0x52544c33);
+    o.writeInt (0x52544c34);
     o.writeDouble (sr.load());
     o.writeInt64 (clipOrigin.load());
     o.writeInt (len);
@@ -360,11 +427,12 @@ void RetuneProcessor::getStateInformation (juce::MemoryBlock& dest)
     }
     o.writeInt (analysis.hop); o.writeInt (analysis.frameOffset); o.writeInt ((int) analysis.contour.size());
     for (float f : analysis.contour) o.writeFloat (f);
-    o.writeInt (noteMask.load()); o.writeInt (keyRoot.load()); o.writeInt (keyScale.load());
+    o.writeInt (0xfff); o.writeInt (keyRoot.load()); o.writeInt (keyScale.load());
     for (const auto& n : notes)                                   // v3: glide + drift/vibrato per note
     {
         o.writeFloat (n.glideMs); o.writeFloat (n.glideSmooth); o.writeFloat (n.drift); o.writeFloat (n.vibrato);
     }
+    o.writeInt64 ((juce::int64) activeNotes.word (0)); o.writeInt64 ((juce::int64) activeNotes.word (1));   // v4: per-note keyboard
     if (auto xml = apvts.copyState().createXml()) o.writeString (xml->toString()); else o.writeString ({});
 }
 
@@ -373,9 +441,10 @@ void RetuneProcessor::setStateInformation (const void* data, int size)
     if (size < 32) return;
     juce::MemoryInputStream in (data, (size_t) size, false);
     const int magic = in.readInt();
-    if (magic != 0x52544c31 && magic != 0x52544c32 && magic != 0x52544c33) return;
+    if (magic < 0x52544c31 || magic > 0x52544c34) return;
     const bool v2 = (magic != 0x52544c31);                    // v2 also stores the key
-    const bool v3 = (magic == 0x52544c33);                    // v3 also stores glide + drift/vibrato
+    const bool v3 = (magic >= 0x52544c33);                    // v3 also stores glide + drift/vibrato
+    const bool v4 = (magic >= 0x52544c34);                    // v4 also stores the keyboard per note
     in.readDouble();
     const juce::int64 origin = in.readInt64();
     const int len = juce::jmin (in.readInt(), (int) source[0].size());
@@ -395,13 +464,19 @@ void RetuneProcessor::setStateInformation (const void* data, int size)
     for (auto& f : an.contour) f = in.readFloat();
     if (v2)
     {
-        noteMask.store (in.readInt()); keyRoot.store (in.readInt()); keyScale.store (in.readInt());
+        activeNotes.setPitchClasses (in.readInt()); keyRoot.store (in.readInt()); keyScale.store (in.readInt());
     }
     if (v3)
         for (auto& n : nts)
         {
             n.glideMs = in.readFloat(); n.glideSmooth = in.readFloat(); n.drift = in.readFloat(); n.vibrato = in.readFloat();
         }
+    if (v4)
+    {
+        const auto a = (juce::uint64) in.readInt64();
+        const auto b = (juce::uint64) in.readInt64();
+        activeNotes.setWords (a, b);
+    }
     if (! in.isExhausted())
         if (auto xml = juce::XmlDocument::parse (in.readString()))
             apvts.replaceState (juce::ValueTree::fromXml (*xml));

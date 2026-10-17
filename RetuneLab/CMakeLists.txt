@@ -15,7 +15,7 @@ juce_add_plugin(RetuneLab
     IS_SYNTH FALSE NEEDS_MIDI_INPUT FALSE
     COPY_PLUGIN_AFTER_BUILD ${COPY_AFTER_BUILD})
 
-target_sources(RetuneLab PRIVATE Source/VocalFx.h Source/AirFx.h Source/PluginProcessor.h Source/PluginProcessor.cpp Source/PluginEditor.h Source/PluginEditor.cpp Source/ClipEngine.h Source/ClipEngine.cpp)
+target_sources(RetuneLab PRIVATE Source/Dashboard.h Source/Dashboard.cpp Source/VocalFx.h Source/AirFx.h Source/PluginProcessor.h Source/PluginProcessor.cpp Source/PluginEditor.h Source/PluginEditor.cpp Source/ClipEngine.h Source/ClipEngine.cpp)
 target_compile_definitions(RetuneLab PUBLIC JUCE_WEB_BROWSER=0 JUCE_USE_CURL=0 JUCE_VST3_CAN_REPLACE_VST2=0)
 target_link_libraries(RetuneLab PRIVATE juce::juce_audio_utils juce::juce_dsp
     PUBLIC juce::juce_recommended_config_flags juce::juce_recommended_warning_flags)

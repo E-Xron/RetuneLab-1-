@@ -2,6 +2,7 @@
 #include <functional>
 #include "PluginProcessor.h"
 #include "Look.h"
+#include "Dashboard.h"
 
 // ---- scale tables shared by the note editor and the toolbar
 inline const juce::StringArray& scaleNames()
@@ -58,7 +59,7 @@ public:
 
 private:
     enum Zone { None, Body, LeftEdge, RightEdge };
-    static constexpr float kKeyW = 56.f, kRuler = 16.f;
+    static constexpr float kKeyW = 64.f, kRuler = 18.f;
 
     void timerCallback() override;
     double sr() const { return proc.getSr(); }
@@ -83,7 +84,7 @@ private:
     ClipAnalysis analysisCache;
     int lastVersion = -1;
     bool keyDrag = false, keyPaintState = true;   // painting allowed notes on the keyboard strip
-    int pitchClassAtY (float y) const { return ((((int) std::floor (midiFromY (y) + 0.5f)) % 12) + 12) % 12; }
+    int noteAtY (float y) const { return (int) std::floor (midiFromY (y) + 0.5f); }
     double scrollSec = 0.0, pps = 100.0, rowH = 16.0, topMidi = 84.0;
     float hoverX = -1.f;
 
@@ -106,41 +107,6 @@ public:
     explicit ToolWindow (const juce::String& name)
         : juce::DocumentWindow (name, Theme::panel, juce::DocumentWindow::closeButton) {}
     void closeButtonPressed() override { setVisible (false); }
-};
-
-// The Effects window: a dropdown of every effect, an on/off switch, and that effect's controls.
-class FxPanel : public juce::Component, private juce::Timer
-{
-public:
-    FxPanel (RetuneProcessor&, NoteEditor&);
-    ~FxPanel() override;
-    void showPage (int page);
-    void paint (juce::Graphics&) override;
-    void resized() override;
-
-    static int numPages();
-    static juce::String pageName (int page);
-    static juce::String pageOnParam (int page);
-
-private:
-    void timerCallback() override;
-    void buildPage();
-
-    RetuneProcessor& proc;
-    NoteEditor& editor;
-    int page = 0;
-    juce::ComboBox pageBox;
-    juce::ToggleButton onBtn { "On" };
-    juce::Label info;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> onAtt;
-    juce::OwnedArray<juce::Slider> knobs;
-    juce::OwnedArray<juce::Label> knobLabels;
-    juce::OwnedArray<juce::AudioProcessorValueTreeState::SliderAttachment> knobAtts;
-    std::unique_ptr<juce::ComboBox> choice;
-    std::unique_ptr<juce::Label> choiceLabel;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> choiceAtt;
-    std::vector<int> shapeField;                  // per knob: note field it edits, or -1 for a parameter
-    bool shapeDragging = false;
 };
 
 class HotkeyPanel : public juce::Component
@@ -186,5 +152,8 @@ private:
     juce::ComboBox keyBox, scaleBox;
     juce::Label statusLabel;
     std::unique_ptr<ToolWindow> fxWin, keyWin;
-    FxPanel* fxPanel = nullptr;
+    static constexpr int kBarH = 58;
+    juce::Rectangle<int> logoArea;
+    std::vector<int> dividers;
+    FxDashboard* fxPanel = nullptr;
 };

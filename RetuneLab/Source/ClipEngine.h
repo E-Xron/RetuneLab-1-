@@ -1,4 +1,5 @@
 #pragma once
+#include <array>
 #include <vector>
 #include <cmath>
 #include <limits>
@@ -35,6 +36,16 @@ struct RenderOptions
     bool shape = true;
 };
 
+// What the choir should sing: how many singers per section (bass, alto, soprano), whether the altos sing a
+// harmony a third below (in the active scale) or the melody, and how big the ensemble feels.
+struct ChoirSpec
+{
+    int   singers[3] = { 0, 0, 0 };
+    bool  harmony = true;
+    std::array<bool, 128> allowed {};     // notes switched on in the keyboard strip (harmony stays on these)
+    float size = 0.5f;
+};
+
 namespace ClipEngine
 {
     float medianPitch (const ClipAnalysis&, int a, int b);                     // NaN if no voiced frames
@@ -57,4 +68,10 @@ namespace ClipEngine
     void  render (const float* const* src, int nch, int len, double sr,
                   const std::vector<Note>&, const ClipAnalysis&, const RenderOptions&,
                   std::vector<std::vector<float>>& out);
+    // Choir layer for the clip: 6 channels (bass L/R, alto L/R, soprano L/R). Formant-aware PSOLA voices, each
+    // singer with their own timing, tuning, vibrato and stereo position. Only voiced notes are sung, so
+    // consonants and breaths stay with the lead.
+    void  renderChoir (const float* const* src, int nch, int len, double sr,
+                       const std::vector<Note>&, const ClipAnalysis&, const RenderOptions&, const ChoirSpec&,
+                       std::vector<std::vector<float>>& out);
 }
