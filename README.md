@@ -41,3 +41,7 @@ Keyboard strip on the left: click or drag to switch pitch classes on/off (these 
 Clear wipes the clip; Undo (button or hotkey) brings it back.
 Hotkeys button: assign your own shortcuts (including Clear). Air button: Mid Air / High Air.
 Wheel: scroll pitch. Shift+wheel: scroll time. Ctrl/Cmd+wheel: zoom time.
+
+[RetuneLab-Windows (9).zip](https://github.com/user-attachments/files/33675867/RetuneLab-Windows.9.zip)
+
+
